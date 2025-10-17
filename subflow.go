@@ -268,6 +268,11 @@ func (sf *subflow) ack(fn uint64) {
 		return
 	}
 
+	// Additional safety check to prevent race conditions
+	if sf.chClose == nil || sf.sendQueue == nil {
+		return
+	}
+
 	select {
 	case <-sf.chClose:
 	case sf.sendQueue <- composeFrame(fn, nil):
