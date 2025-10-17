@@ -139,7 +139,7 @@ func (rq *receiveQueue) read(b []byte) (int, error) {
 		// Check for data availability and read in a single lock acquisition
 		rq.readLock.Lock()
 		hasData := rq.buf[rq.rp].bytes != nil
-		
+
 		if hasData {
 			// We have data, process it in the same lock
 			totalN := 0
@@ -151,11 +151,11 @@ func (rq *receiveQueue) read(b []byte) (int, error) {
 
 				// Validate frame sequence with better error handling
 				if currentFrameNumber != expectedFrameNumber && expectedFrameNumber != 1 {
-					log.Errorf("receiveQueue buffer corruption detected [%v vs %v] (The crash happened at idx = %d)", currentFrameNumber, expectedFrameNumber, rq.rp)
-					log.Tracef("All Buffers: ")
-					for idx, v := range rq.buf {
-						log.Tracef("\t[%d]fn %d, [%d]byte\n", idx, v.fn, len(v.bytes))
-					}
+					// log.Errorf("receiveQueue buffer corruption detected [%v vs %v] (The crash happened at idx = %d)", currentFrameNumber, expectedFrameNumber, rq.rp)
+					// log.Tracef("All Buffers: ")
+					// for idx, v := range rq.buf {
+					// 	log.Tracef("\t[%d]fn %d, [%d]byte\n", idx, v.fn, len(v.bytes))
+					// }
 					rq.close()
 					rq.readLock.Unlock()
 					return 0, ErrClosed
