@@ -242,14 +242,11 @@ func TestReceiveQueueEmptyRead(t *testing.T) {
 	buffer := make([]byte, 10)
 
 	// This should block, so we'll use a goroutine with timeout
-	readDone := make(chan bool, 1)
+	readDone := make(chan error, 1)
 
 	go func() {
 		_, err := rq.read(buffer)
-		readDone <- true
-		if err != nil {
-			t.Errorf("Unexpected error: %v", err)
-		}
+		readDone <- err
 	}()
 
 	// Wait a bit to ensure it's blocking
@@ -261,8 +258,10 @@ func TestReceiveQueueEmptyRead(t *testing.T) {
 
 	// Wait for read to complete
 	select {
-	case <-readDone:
-		// Success
+	case err := <-readDone:
+		if err != nil {
+			t.Errorf("Unexpected error: %v", err)
+		}
 	case <-time.After(100 * time.Millisecond):
 		t.Error("Read should have completed")
 	}
