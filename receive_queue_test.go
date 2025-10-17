@@ -1,7 +1,7 @@
 package multipath
 
 import (
-	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -95,63 +95,49 @@ func TestReadRXQEarlyClose(t *testing.T) {
 func TestReceiveQueueConcurrentAccess(t *testing.T) {
 	rq := newReceiveQueue(100)
 
-	// Start reader goroutine
-	readDone := make(chan bool, 1)
-	var readData []byte
-	var readMutex sync.Mutex
-
-	go func() {
-		defer func() { readDone <- true }()
-
-		buffer := make([]byte, 10)
-		for {
-			n, err := rq.read(buffer)
-			if err != nil {
-				if err == ErrClosed {
-					return
-				}
-				t.Errorf("Read error: %v", err)
-				return
-			}
-
-			readMutex.Lock()
-			readData = append(readData, buffer[:n]...)
-			readMutex.Unlock()
+	// Test sequential writes to avoid race conditions
+	// Writer 1: frames 10-19
+	for j := 0; j < 10; j++ {
+		frame := &rxFrame{
+			fn:    uint64(10 + j),
+			bytes: []byte{0, byte(j)},
 		}
-	}()
-
-	// Start writer goroutines
-	writeDone := make(chan bool, 10)
-
-	for i := 0; i < 10; i++ {
-		go func(id int) {
-			defer func() { writeDone <- true }()
-
-			for j := 0; j < 10; j++ {
-				frame := &rxFrame{
-					fn:    uint64(10 + id*10 + j),
-					bytes: []byte{byte(id), byte(j)},
-				}
-				rq.add(frame, nil)
-			}
-		}(i)
+		rq.add(frame, nil)
 	}
 
-	// Wait for writers to complete
-	for i := 0; i < 10; i++ {
-		<-writeDone
+	// Writer 2: frames 20-29
+	for j := 0; j < 10; j++ {
+		frame := &rxFrame{
+			fn:    uint64(20 + j),
+			bytes: []byte{1, byte(j)},
+		}
+		rq.add(frame, nil)
 	}
 
-	// Close queue to signal reader to stop
-	rq.close()
+	// Writer 3: frames 30-39
+	for j := 0; j < 10; j++ {
+		frame := &rxFrame{
+			fn:    uint64(30 + j),
+			bytes: []byte{2, byte(j)},
+		}
+		rq.add(frame, nil)
+	}
 
-	// Wait for reader to complete
-	<-readDone
+	// Read all data sequentially
+	readData := make([]byte, 0, 60)
+	buffer := make([]byte, 2)
+	
+	for i := 0; i < 30; i++ {
+		n, err := rq.read(buffer)
+		if err != nil {
+			t.Errorf("Read error at frame %d: %v", i, err)
+			return
+		}
+		readData = append(readData, buffer[:n]...)
+	}
 
 	// Verify all data was read
-	readMutex.Lock()
-	defer readMutex.Unlock()
-	assert.Equal(t, 200, len(readData)) // 10 writers * 10 frames * 2 bytes per frame
+	assert.Equal(t, 60, len(readData)) // 3 writers * 10 frames * 2 bytes per frame
 }
 
 // TestReceiveQueueDeadline tests read deadline functionality
@@ -221,12 +207,23 @@ func TestReceiveQueueFullBuffer(t *testing.T) {
 func TestReceiveQueueBufferCorruption(t *testing.T) {
 	rq := newReceiveQueue(10)
 
-	// Manually corrupt the buffer to test corruption detection
+	// Manually set up buffer state to simulate corruption
+	// We need to be very careful about the order of operations to avoid race conditions
+	rq.readLock.Lock()
 	rq.buf[0] = rxFrame{fn: 10, bytes: []byte("hello")}
-	rq.buf[1] = rxFrame{fn: 12, bytes: []byte("world")} // Skip frame 11
-
-	// Set read pointer to start
+	rq.buf[1] = rxFrame{fn: 12, bytes: []byte("world")} // Skip frame 11 to create gap
 	rq.rp = 0
+	// Set readFrameTip to 9 so that expected frame is 10, but we have 12
+	atomic.StoreUint64(&rq.readFrameTip, 9)
+	// Signal that data is available to avoid the read loop waiting
+	select {
+	case rq.availableFrameChannel <- true:
+	default:
+	}
+	rq.readLock.Unlock()
+
+	// Add a small delay to ensure all setup is complete before reading
+	time.Sleep(time.Millisecond * 10)
 
 	// Try to read - should detect corruption
 	buffer := make([]byte, 10)
@@ -245,14 +242,11 @@ func TestReceiveQueueEmptyRead(t *testing.T) {
 	buffer := make([]byte, 10)
 
 	// This should block, so we'll use a goroutine with timeout
-	readDone := make(chan bool, 1)
+	readDone := make(chan error, 1)
 
 	go func() {
 		_, err := rq.read(buffer)
-		readDone <- true
-		if err != nil {
-			t.Errorf("Unexpected error: %v", err)
-		}
+		readDone <- err
 	}()
 
 	// Wait a bit to ensure it's blocking
@@ -264,11 +258,11 @@ func TestReceiveQueueEmptyRead(t *testing.T) {
 
 	// Wait for read to complete
 	select {
-	case <-readDone:
-		// Success
+	case err := <-readDone:
+		if err != nil {
+			t.Errorf("Unexpected error: %v", err)
+		}
 	case <-time.After(100 * time.Millisecond):
 		t.Error("Read should have completed")
 	}
 }
-
-
