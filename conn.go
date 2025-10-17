@@ -44,19 +44,36 @@ func (bc *mpConn) Read(b []byte) (n int, err error) {
 
 func (bc *mpConn) Write(b []byte) (n int, err error) {
 	frame := composeFrame(atomic.AddUint64(&bc.lastFN, 1), b)
+	defer func() {
+		if err != nil {
+			frame.release()
+		}
+	}()
 
 	for {
+		// Check if connection is closed
+		if atomic.LoadUint32(&bc.closed) == 1 {
+			return 0, ErrClosed
+		}
+
+		// Atomic check for inflight frames with proper backpressure
 		bc.pendingAckMu.RLock()
 		inflight := len(bc.pendingAckMap)
 		bc.pendingAckMu.RUnlock()
+
 		if inflight > 500 {
 			time.Sleep(time.Millisecond * 100)
-			log.Tracef("too many inflights")
+			log.Tracef("too many inflights: %d", inflight)
 			continue
 		}
 
-		for _, sf := range bc.sortedSubflows() {
+		subflows := bc.sortedSubflows()
+		if len(subflows) == 0 {
+			return 0, ErrClosed
+		}
 
+		// Try to send on available subflows
+		for _, sf := range subflows {
 			if atomic.LoadUint64(&sf.actuallyBusyOnWrite) == 1 {
 				// Avoid a possibly blocked writer for a retransmit
 				continue
@@ -66,13 +83,17 @@ func (bc *mpConn) Write(b []byte) (n int, err error) {
 			case sf.sendQueue <- frame:
 				return len(b), nil
 			default:
+				// Subflow is busy, try next one
 			}
 		}
-		if len(bc.sortedSubflows()) == 0 {
+
+		// All subflows are busy, wait for one to become available
+		select {
+		case <-bc.writerMaybeReady:
+			// Try again
+		case <-time.After(time.Second * 5):
 			return 0, ErrClosed
 		}
-
-		<-bc.writerMaybeReady
 	}
 }
 
@@ -135,52 +156,66 @@ func (bc *mpConn) retransmit(frame *sendFrame) {
 		atomic.StoreUint64(&frame.beingRetransmitted, 0)
 	}()
 
+	// Check if connection is closed
+	if atomic.LoadUint32(&bc.closed) == 1 {
+		frame.release()
+		return
+	}
+
 	subflows := bc.sortedSubflows()
+	if len(subflows) == 0 {
+		log.Debugf("no subflows available for retransmission of frame %d", frame.fn)
+		frame.release()
+		return
+	}
 
 	alreadyTransmittedOnAllSubflows := false
-	for {
-		abort := false
-		if bc.closed == 1 {
+	maxRetries := len(subflows) * 2 // Allow multiple attempts per subflow
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if atomic.LoadUint32(&bc.closed) == 1 {
 			return
 		}
 
 		var selectedSubflow *subflow
+		var abort bool
 
-		abort, alreadyTransmittedOnAllSubflows, selectedSubflow = selectSubflowForRetransmit(subflows, frame, false)
+		abort, alreadyTransmittedOnAllSubflows, selectedSubflow = selectSubflowForRetransmit(subflows, frame, attempt >= len(subflows))
 		if selectedSubflow == nil {
-			abort, alreadyTransmittedOnAllSubflows, selectedSubflow = selectSubflowForRetransmit(subflows, frame, true)
-			if selectedSubflow == nil {
-				abort = true
-				alreadyTransmittedOnAllSubflows = true
+			if abort {
 				break
 			}
+			continue
 		}
 
+		// Try to send on selected subflow
 		select {
 		case <-selectedSubflow.chClose:
 			continue
 		case selectedSubflow.sendQueue <- frame:
 			frame.retransmissions++
-			log.Debugf("retransmitted frame %d via %s", frame.fn, selectedSubflow.to)
+			log.Debugf("retransmitted frame %d via %s (attempt %d)", frame.fn, selectedSubflow.to, attempt+1)
 			if frame.sentVia == nil {
 				frame.sentVia = make([]transmissionDatapoint, 0)
 			}
 			frame.sentVia = append(frame.sentVia, transmissionDatapoint{selectedSubflow, time.Now()})
 			return
 		default:
+			// Subflow is busy, try next one
 		}
 
-		if abort {
-			break
+		// Wait a bit before trying again
+		select {
+		case <-bc.tryRetransmit:
+		case <-time.After(time.Millisecond * 10):
 		}
-		<-bc.tryRetransmit
 	}
 
 	if !alreadyTransmittedOnAllSubflows {
-		log.Debugf("frame %d is being retransmitted on all subflows of %x", frame.fn, bc.cid)
+		log.Debugf("frame %d failed to retransmit on all subflows of %x", frame.fn, bc.cid)
+		// If we can't retransmit, release the frame to prevent memory leak
+		frame.release()
 	}
-
-	return
 }
 
 func selectSubflowForRetransmit(subflows []*subflow, frame *sendFrame, timeFallback bool) (bool, bool, *subflow) {
@@ -258,50 +293,53 @@ func (bc *mpConn) remove(theSubflow *subflow) {
 
 func (bc *mpConn) retransmitLoop() {
 	evalTick := time.NewTicker(time.Millisecond * 100)
+	defer evalTick.Stop()
+
 	for {
-		select {
-		case <-evalTick.C:
-		}
+		<-evalTick.C
 		if atomic.LoadUint32(&bc.closed) == 1 {
 			return
 		}
 
+		// Collect frames that need retransmission
 		bc.pendingAckMu.RLock()
-		RetransmitFrames := make([]pendingAck, 0)
-		for fn, frame := range bc.pendingAckMap {
-			if time.Since(frame.sentAt) > frame.outboundSf.retransTimer() {
-				if bc.pendingAckMap[fn] != nil {
-					RetransmitFrames = append(RetransmitFrames, *frame)
-				}
+		retransmitFrames := make([]pendingAck, 0, len(bc.pendingAckMap))
+		now := time.Now()
+		for _, frame := range bc.pendingAckMap {
+			if frame != nil && now.Sub(frame.sentAt) > frame.outboundSf.retransTimer() {
+				retransmitFrames = append(retransmitFrames, *frame)
 			}
 		}
 		bc.pendingAckMu.RUnlock()
 
-		sort.Slice(RetransmitFrames, func(i, j int) bool {
-			return RetransmitFrames[i].fn < RetransmitFrames[j].fn
+		// Sort by frame number for ordered retransmission
+		sort.Slice(retransmitFrames, func(i, j int) bool {
+			return retransmitFrames[i].fn < retransmitFrames[j].fn
 		})
 
-		for _, frame := range RetransmitFrames {
+		// Process retransmissions
+		for _, frame := range retransmitFrames {
 			sendframe := frame.framePtr
+			if sendframe == nil {
+				continue
+			}
+
 			sendframe.changeLock.Lock()
+			// Double-check if frame is still pending
 			if bc.isPendingAck(frame.fn) {
-				// No ack means the subflow fails or has a longer RTT
-				// log.Errorf("Retransmitting! %#v", frame.fn)
-				if sendframe.beingRetransmitted == 0 {
+				// Only retransmit if not already being retransmitted
+				if atomic.LoadUint64(&sendframe.beingRetransmitted) == 0 {
 					go bc.retransmit(sendframe)
 				}
-				sendframe.changeLock.Unlock()
 			} else {
-				// It is ok to release buffer here as the frame will never
-				// be retransmitted again.
+				// Frame was acked, clean up
 				sendframe.release()
-				sendframe.changeLock.Unlock()
 				bc.pendingAckMu.Lock()
 				delete(bc.pendingAckMap, frame.fn)
 				bc.pendingAckMu.Unlock()
 			}
+			sendframe.changeLock.Unlock()
 		}
-
 	}
 }
 

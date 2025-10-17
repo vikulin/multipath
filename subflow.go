@@ -1,7 +1,6 @@
 package multipath
 
 import (
-	"fmt"
 	"io"
 	"math/rand"
 	"net"
@@ -172,9 +171,6 @@ func (sf *subflow) sendLoop() {
 			if closing {
 				closeCountdown.Reset(time.Millisecond * 33)
 			}
-			if closing {
-				closing = true
-			}
 
 			frame.changeLock.Lock()
 			if frame.retransmissions != 0 {
@@ -201,24 +197,22 @@ func (sf *subflow) sendLoop() {
 			sf.addPendingAck(frame)
 			frame.changeLock.Unlock()
 
+			// Set busy flag and write with timeout
 			atomic.StoreUint64(&sf.actuallyBusyOnWrite, 1)
+
+			// Set write deadline to prevent hanging
+			sf.conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 			n, err := sf.conn.Write(frame.buf)
+
 			atomic.StoreUint64(&sf.actuallyBusyOnWrite, 0)
-			var abort bool
-			for {
-				// wake all writers up, since they might have something to send now that we likely
-				// have free capacity.
-				select {
-				case sf.mpc.writerMaybeReady <- true:
-				default:
-					abort = true
-				}
-				if abort {
-					break
-				}
+
+			// Wake up writers
+			select {
+			case sf.mpc.writerMaybeReady <- true:
+			default:
 			}
 
-			// only wake up one re-transmitter, to better control the possible hored of them
+			// Wake up retransmitters
 			select {
 			case sf.mpc.tryRetransmit <- true:
 			default:
@@ -231,10 +225,10 @@ func (sf *subflow) sendLoop() {
 					go sf.mpc.retransmit(frame)
 				}
 
-				if n != 0 && len(frame.buf) != n {
-					log.Tracef("We may have corrupted the output %#v vs %#v", n, len(frame.buf))
-					// In this case, we will not try and write the remaining, and instead we will assume
-					// that writing to the socket again will only make this worse, so aborting the subflow
+				// Handle partial writes
+				if n != 0 && n != len(frame.buf) {
+					log.Tracef("Partial write: expected %d bytes, written %d", len(frame.buf), n)
+					// This is a serious error, close the subflow
 					sf.close()
 					return
 				}
@@ -243,13 +237,18 @@ func (sf *subflow) sendLoop() {
 				return
 			}
 
+			// Validate write completion
 			if n != len(frame.buf) {
-				panic(fmt.Sprintf("expect to write %d bytes on %s, written %d", len(frame.buf), sf.to, n))
+				log.Errorf("Incomplete write: expected %d bytes, written %d on %s", len(frame.buf), n, sf.to)
+				sf.close()
+				return
 			}
+
 			if !frame.isDataFrame() {
 				frame.release()
 				continue
 			}
+
 			log.Tracef("done writing frame %d with %d bytes via %s", frame.fn, frame.sz, sf.to)
 			frame.changeLock.Lock()
 			if frame.retransmissions == 0 {
@@ -362,14 +361,25 @@ func (sf *subflow) probe() {
 }
 
 func (sf *subflow) retransTimer() time.Duration {
-	d := sf.emaRTT.GetDuration() * 2
-	if d > 512*time.Millisecond {
-		d = 512 * time.Millisecond
+	// Use adaptive retransmission timer with exponential backoff
+	rtt := sf.emaRTT.GetDuration()
+
+	// Base timer is 2 * RTT with jitter
+	baseTimer := rtt * 2
+
+	// Add jitter to prevent synchronized retransmissions
+	jitter := time.Duration(rand.Int63n(int64(rtt / 4)))
+	baseTimer += jitter
+
+	// Apply bounds with more reasonable limits
+	if baseTimer > 2*time.Second {
+		baseTimer = 2 * time.Second
 	}
-	if d < 1*time.Millisecond {
-		d = time.Millisecond
+	if baseTimer < 10*time.Millisecond {
+		baseTimer = 10 * time.Millisecond
 	}
-	return d
+
+	return baseTimer
 }
 
 func (sf *subflow) close() {

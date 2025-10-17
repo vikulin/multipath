@@ -54,18 +54,8 @@ func (rq *receiveQueue) add(f *rxFrame, sf *subflow) {
 	// Instead let's quickly check if we have all of the data we need
 	// to read, and if we do, hang until we don't have that problem anymore
 	if rq.isFull() {
-		for {
-			var abort bool
-			select {
-			case <-rq.readNotifyChannel:
-				if !rq.isFull() {
-					abort = true
-					break
-				}
-			}
-			if abort {
-				break
-			}
+		for rq.isFull() {
+			<-rq.readNotifyChannel
 		}
 	}
 	select {
@@ -160,12 +150,14 @@ func (rq *receiveQueue) tryAdd(f *rxFrame) bool {
 
 func (rq *receiveQueue) read(b []byte) (int, error) {
 	for {
+		// Check for data availability atomically
 		rq.readLock.Lock()
-		if rq.buf[rq.rp].bytes != nil {
-			rq.readLock.Unlock()
+		hasData := rq.buf[rq.rp].bytes != nil
+		rq.readLock.Unlock()
+
+		if hasData {
 			break
 		}
-		rq.readLock.Unlock()
 
 		if atomic.LoadUint32(&rq.fullyClosed) == 1 {
 			return 0, ErrClosed
@@ -194,9 +186,13 @@ func (rq *receiveQueue) read(b []byte) (int, error) {
 	totalN := 0
 	cur := rq.buf[rq.rp].bytes
 	for cur != nil && totalN < len(b) {
-		oldFrameTip := atomic.LoadUint64(&rq.readFrameTip)
-		if (rq.buf[rq.rp].fn != oldFrameTip+1) && (rq.buf[rq.rp].fn != oldFrameTip) && oldFrameTip != 0 {
-			log.Errorf("receiveQueue buffer corruption detected [%v vs %v] (The crash happened at idx = %d)", rq.buf[rq.rp].fn, oldFrameTip+1, rq.rp)
+		// Get current frame tip atomically
+		expectedFrameNumber := atomic.LoadUint64(&rq.readFrameTip) + 1
+		currentFrameNumber := rq.buf[rq.rp].fn
+
+		// Validate frame sequence with better error handling
+		if currentFrameNumber != expectedFrameNumber && expectedFrameNumber != 1 {
+			log.Errorf("receiveQueue buffer corruption detected [%v vs %v] (The crash happened at idx = %d)", currentFrameNumber, expectedFrameNumber, rq.rp)
 			log.Tracef("All Buffers: ")
 			for idx, v := range rq.buf {
 				log.Tracef("\t[%d]fn %d, [%d]byte\n", idx, v.fn, len(v.bytes))
@@ -204,10 +200,12 @@ func (rq *receiveQueue) read(b []byte) (int, error) {
 			rq.close()
 			return 0, ErrClosed
 		}
+
 		n := copy(b[totalN:], cur)
 		if n == len(cur) {
-			log.Tracef("Finished with read frame %d\n", rq.buf[rq.rp].fn)
-			atomic.StoreUint64(&rq.readFrameTip, rq.buf[rq.rp].fn)
+			log.Tracef("Finished with read frame %d\n", currentFrameNumber)
+			// Update frame tip atomically after successful read
+			atomic.StoreUint64(&rq.readFrameTip, currentFrameNumber)
 			pool.Put(cur)
 			rq.buf[rq.rp].bytes = nil
 			rq.rp = (rq.rp + 1) % rq.size
@@ -215,12 +213,13 @@ func (rq *receiveQueue) read(b []byte) (int, error) {
 			// The frames in the ring buffer are never overridden, so we can
 			// safely update the bytes to reflect the next read position.
 			rq.buf[rq.rp].bytes = cur[n:]
-			log.Tracef("Partial read frame %d\n", rq.buf[rq.rp].fn)
+			log.Tracef("Partial read frame %d\n", currentFrameNumber)
 		}
 		totalN += n
 		cur = rq.buf[rq.rp].bytes
 	}
 
+	// Notify that we've consumed data
 	select {
 	case rq.readNotifyChannel <- true:
 	default:
@@ -240,7 +239,7 @@ func (rq *receiveQueue) setReadDeadline(dl time.Time) {
 	rq.readDeadline = dl
 	rq.deadlineLock.Unlock()
 	if !dl.IsZero() {
-		ttl := dl.Sub(time.Now())
+		ttl := time.Until(dl)
 		if ttl <= 0 {
 			for {
 				abort := false
@@ -280,3 +279,5 @@ func (rq *receiveQueue) close() {
 		}
 	}
 }
+
+

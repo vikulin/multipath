@@ -183,13 +183,26 @@ func (mpd *mpDialer) sorted() []*subflowDialer {
 	dialersCopy := make([]*subflowDialer, len(mpd.dialers))
 	copy(dialersCopy, mpd.dialers)
 	sort.Slice(dialersCopy, func(i, j int) bool {
+		// Consider both RTT and success rate for better load balancing
 		it := dialersCopy[i].emaRTT.GetDuration()
 		jt := dialersCopy[j].emaRTT.GetDuration()
-		// both have unknown RTT or fail to dial, give each a chance
-		if it == jt {
-			return rand.Intn(2) > 0
+
+		// Get success rates
+		iSuccesses := atomic.LoadUint64(&dialersCopy[i].consecSuccesses)
+		jSuccesses := atomic.LoadUint64(&dialersCopy[j].consecSuccesses)
+
+		// Prefer dialers with higher success rates
+		if iSuccesses != jSuccesses {
+			return iSuccesses > jSuccesses
 		}
-		return it < jt
+
+		// If success rates are equal, prefer lower RTT
+		if it != jt {
+			return it < jt
+		}
+
+		// If both RTT and success rates are equal, randomize
+		return rand.Intn(2) > 0
 	})
 	return dialersCopy
 }

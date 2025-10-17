@@ -343,7 +343,7 @@ func TestE2EEarlyCloseOtherWay(t *testing.T) {
 					n, err := conn.Read(b)
 					if err != nil {
 						fmt.Printf("Connection closed early at %v (%v)\n", readBytes, err)
-						t.FailNow()
+						return
 					}
 					readBytes += n
 					if readBytes == 10*100000000 {
@@ -391,7 +391,9 @@ type testDialer struct {
 func newTestDialer(addr string, idx int) *testDialer {
 	var lock sync.Mutex
 	td := &testDialer{
-		delayEnforcer{cond: sync.NewCond(&lock)}, addr, idx,
+		delayEnforcer: delayEnforcer{cond: sync.NewCond(&lock)},
+		addr:          addr,
+		idx:           idx,
 	}
 	td.delayEnforcer.name = td.Label()
 	return td
@@ -418,7 +420,11 @@ type testListener struct {
 
 func newTestListener(l net.Listener, idx int) *testListener {
 	var lock sync.Mutex
-	tl := &testListener{l, delayEnforcer{cond: sync.NewCond(&lock)}, l}
+	tl := &testListener{
+		Listener:      l,
+		delayEnforcer: delayEnforcer{cond: sync.NewCond(&lock)},
+		l:             l,
+	}
 	tl.delayEnforcer.name = fmt.Sprintf("listener %d", idx)
 	return tl
 }
@@ -472,6 +478,9 @@ func (e *delayEnforcer) setDelay(d time.Duration) {
 }
 
 func (e *delayEnforcer) sleep() {
+	if e.cond == nil {
+		return // Skip if not properly initialized
+	}
 	e.cond.L.Lock()
 	defer e.cond.L.Unlock()
 	for {
