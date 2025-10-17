@@ -161,7 +161,9 @@ func NewFlowControl(initialWindow uint32) *FlowControl {
 func (fc *FlowControl) CanSend(size uint32) bool {
 	fc.mu.RLock()
 	defer fc.mu.RUnlock()
-	return fc.windowUsed+size <= fc.rwnd
+	// Use atomic read to avoid race condition
+	windowUsed := atomic.LoadUint32(&fc.windowUsed)
+	return windowUsed+size <= fc.rwnd
 }
 
 // OnDataSent is called when data is sent
