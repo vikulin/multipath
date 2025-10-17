@@ -26,8 +26,8 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y gcc
     
-    - name: Run tests with coverage and race detection
-      run: CGO_ENABLED=1 go test -v -race -coverprofile=coverage.out -timeout 30s -run "TestCongestionControl|TestFlowControl|TestEnhancedStatsTracker|TestReceiveQueue"
+    - name: Run all tests with coverage and race detection
+      run: CGO_ENABLED=1 go test -v -race -coverprofile=coverage.out -timeout 200s
     
     - name: Generate HTML coverage report
       run: go tool cover -html=coverage.out -o coverage.html
@@ -37,15 +37,27 @@ jobs:
     
     - name: Generate JUnit test report
       run: |
-        CGO_ENABLED=1 go test -v -json -race -timeout 30s -run "TestCongestionControl|TestFlowControl|TestEnhancedStatsTracker|TestReceiveQueue" > test-results.json || true
+        CGO_ENABLED=1 go test -v -json -race -timeout 200s > test-results.json || true
+        
+        # Count tests and failures
+        TEST_COUNT=$(grep -c '"Test":' test-results.json || echo "0")
+        FAILURE_COUNT=$(grep -c '"Action":"fail"' test-results.json || echo "0")
+        
+        # Get total time (extract from last "Elapsed" field)
+        TOTAL_TIME=$(grep "Elapsed" test-results.json | tail -1 | sed 's/.*"Elapsed":\([0-9.]*\).*/\1/' || echo "0")
+        
         # Convert JSON to JUnit XML format
         echo '<?xml version="1.0" encoding="UTF-8"?>' > test-results.xml
         echo '<testsuites>' >> test-results.xml
-        echo '  <testsuite name="multipath" tests="$(grep -c "Test": test-results.json)" failures="$(grep -c "Action":"fail" test-results.json)" time="$(grep "Elapsed" test-results.json | tail -1 | cut -d: -f2 | tr -d ' ' | cut -d. -f1)">' >> test-results.xml
+        echo "  <testsuite name=\"multipath\" tests=\"$TEST_COUNT\" failures=\"$FAILURE_COUNT\" time=\"$TOTAL_TIME\">" >> test-results.xml
+        
+        # Add individual test cases
         grep '"Test":' test-results.json | while read line; do
-          test_name=$(echo "$line" | cut -d'"' -f4)
+          test_name=$(echo "$line" | sed 's/.*"Test":"\([^"]*\)".*/\1/')
           echo "    <testcase name=\"$test_name\" classname=\"multipath\"/>" >> test-results.xml
         done
+        
+        # Close XML
         echo '  </testsuite>' >> test-results.xml
         echo '</testsuites>' >> test-results.xml
 

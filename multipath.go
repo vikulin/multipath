@@ -25,6 +25,14 @@
 //	|  payload size(1-8)  |  frame number (1-8)  |  payload  |
 //	 --------------------------------------------------------
 //
+// For fragmented payloads:
+//
+//	 -------------------------------------------------------------------------
+//	|  payload size(1-8)  |  frame number (1-8)  |  fragment info |  payload  |
+//	 -------------------------------------------------------------------------
+//	|  fragment info: total_fragments(1) |  fragment_index(1) |  fragment_data |
+//	 -------------------------------------------------------------------------
+//
 //	 ---------------------------------------
 //	|  00000000  |  ack frame number (1-8)  |
 //	 ---------------------------------------
@@ -90,6 +98,14 @@ type rxFrame struct {
 	bytes []byte
 }
 
+// fragmentInfo tracks fragments for reassembly
+type fragmentInfo struct {
+	totalFragments uint8
+	fragments      [][]byte // indexed by fragmentIndex
+	receivedCount  uint8
+	baseFrameNum   uint64
+}
+
 type transmissionDatapoint struct {
 	sf     *subflow
 	txTime time.Time
@@ -114,6 +130,22 @@ func composeFrame(fn uint64, b []byte) *sendFrame {
 	WriteVarInt(wb, fn)
 	if sz > 0 {
 		wb.Write(b)
+	}
+	var released int32
+	return &sendFrame{fn: fn, sz: uint64(sz), buf: wb.Bytes(), released: &released}
+}
+
+// composeFragmentFrame creates a frame for a fragment of a larger payload
+func composeFragmentFrame(fn uint64, fragment []byte, fragmentIndex, totalFragments uint8) *sendFrame {
+	sz := len(fragment) + 2 // +2 for fragment info (totalFragments + fragmentIndex)
+	buf := pool.Get(maxVarIntLength + maxVarIntLength + sz)
+	wb := bytes.NewBuffer(buf[:0])
+	WriteVarInt(wb, uint64(sz))
+	WriteVarInt(wb, fn)
+	wb.WriteByte(totalFragments)
+	wb.WriteByte(fragmentIndex)
+	if len(fragment) > 0 {
+		wb.Write(fragment)
 	}
 	var released int32
 	return &sendFrame{fn: fn, sz: uint64(sz), buf: wb.Bytes(), released: &released}

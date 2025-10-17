@@ -93,13 +93,13 @@ func (mpd *mpDialer) DialContext(ctx context.Context) (net.Conn, error) {
 	dialOne := func(d *subflowDialer, cid connectionID) (connectionID, bool) {
 		conn, err := d.DialContext(ctx)
 		if err != nil {
-			log.Errorf("failed to dial %s: %v", d.Label(), err)
+			// log.Debugf("failed to dial %s: %v", d.Label(), err)
 			return zeroCID, false
 		}
 		probeStart := time.Now()
 		newCID, err := mpd.handshake(conn, cid)
 		if err != nil {
-			log.Errorf("failed to handshake %s, continuing: %v", d.Label(), err)
+			// log.Debugf("failed to handshake %s, continuing: %v", d.Label(), err)
 			conn.Close()
 			return zeroCID, false
 		}
@@ -112,19 +112,20 @@ func (mpd *mpDialer) DialContext(ctx context.Context) (net.Conn, error) {
 					case <-ctx.Done():
 						return
 					default:
-						bc.pendingAckMu.RLock()
-						oldest := time.Duration(0)
-						oldestFN := uint64(0)
-						for fn, frame := range bc.pendingAckMap {
-							if time.Since(frame.sentAt) > oldest {
-								oldest = time.Since(frame.sentAt)
-								oldestFN = fn
-							}
-						}
-						bc.pendingAckMu.RUnlock()
-						if oldest > time.Second {
-							log.Debugf("Frame %d has not been acked for %v\n", oldestFN, oldest)
-						}
+						// Debug: Check for unacked frames (commented out to reduce verbosity)
+						// bc.pendingAckMu.RLock()
+						// oldest := time.Duration(0)
+						// oldestFN := uint64(0)
+						// for fn, frame := range bc.pendingAckMap {
+						// 	if time.Since(frame.sentAt) > oldest {
+						// 		oldest = time.Since(frame.sentAt)
+						// 		oldestFN = fn
+						// 	}
+						// }
+						// bc.pendingAckMu.RUnlock()
+						// if oldest > time.Second {
+						// 	log.Debugf("Frame %d has not been acked for %v\n", oldestFN, oldest)
+						// }
 					}
 				}
 			}()

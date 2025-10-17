@@ -138,6 +138,26 @@ func (sf *subflow) readLoopFrames(ch chan *rxFrame, r byteReader) bool {
 			continue
 		}
 
+		// Check if this is a fragment (has fragment info)
+		// Only treat as fragment if it has reasonable fragment metadata
+		if sz >= 2 {
+			// Check if first two bytes look like fragment info (reasonable values)
+			totalFragments := buf[0]
+			fragmentIndex := buf[1]
+
+			// More strict fragment detection in subflow:
+			// - totalFragments must be > 1 and <= 10 (reasonable range)
+			// - fragmentIndex must be < totalFragments and < 10
+			// - frame should have meaningful data (not just 2 bytes)
+			if totalFragments > 1 && totalFragments <= 10 && fragmentIndex < totalFragments && fragmentIndex < 10 && sz > 2 {
+				// This is a fragment, pass it to the receive queue for reassembly
+				ch <- &rxFrame{fn: fn, bytes: buf}
+				sf.tracker.OnRecv(sz)
+				continue
+			}
+		}
+
+		// Regular frame (not a fragment)
 		ch <- &rxFrame{fn: fn, bytes: buf}
 		sf.tracker.OnRecv(sz)
 		select {
@@ -149,7 +169,7 @@ func (sf *subflow) readLoopFrames(ch chan *rxFrame, r byteReader) bool {
 }
 
 func (sf *subflow) sendLoop() {
-	closing := false
+	closing := int32(0) // Use atomic int32 instead of bool
 	closeCountdown := time.NewTimer(time.Millisecond * 33)
 	closeCountdown.Stop()
 	defer func() {
@@ -159,7 +179,7 @@ func (sf *subflow) sendLoop() {
 	go func() {
 		<-sf.chClose
 		closeCountdown.Reset(time.Millisecond * 33)
-		closing = true
+		atomic.StoreInt32(&closing, 1)
 	}()
 
 	for {
@@ -168,7 +188,7 @@ func (sf *subflow) sendLoop() {
 			sf.conn.Close()
 			return
 		case frame := <-sf.sendQueue:
-			if closing {
+			if atomic.LoadInt32(&closing) == 1 {
 				closeCountdown.Reset(time.Millisecond * 33)
 			}
 
@@ -219,7 +239,7 @@ func (sf *subflow) sendLoop() {
 			}
 
 			if err != nil {
-				log.Debugf("failed to write frame %d to %s: %v", frame.fn, sf.to, err)
+				// log.Debugf("failed to write frame %d to %s: %v", frame.fn, sf.to, err)
 
 				if frame.isDataFrame() {
 					go sf.mpc.retransmit(frame)
@@ -373,8 +393,11 @@ func (sf *subflow) retransTimer() time.Duration {
 	baseTimer := rtt * 2
 
 	// Add jitter to prevent synchronized retransmissions
-	jitter := time.Duration(rand.Int63n(int64(rtt / 4)))
-	baseTimer += jitter
+	jitterRange := rtt / 4
+	if jitterRange > 0 {
+		jitter := time.Duration(rand.Int63n(int64(jitterRange)))
+		baseTimer += jitter
+	}
 
 	// Apply bounds with more reasonable limits
 	if baseTimer > 2*time.Second {
@@ -392,14 +415,14 @@ func (sf *subflow) close() {
 		log.Tracef("closing subflow to %s", sf.to)
 		sf.mpc.remove(sf)
 		close(sf.chClose)
-		drainTime := time.Now()
+		// drainTime := time.Now()
 		maxDrainTime := time.NewTimer(time.Second)
 		select {
 		case <-maxDrainTime.C:
 		case <-sf.finishedClosing:
 		}
 		maxDrainTime.Stop()
-		log.Debugf("Took %v to close subflow", time.Since(drainTime))
+		// log.Debugf("Took %v to close subflow", time.Since(drainTime))
 	})
 }
 

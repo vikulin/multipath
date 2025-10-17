@@ -64,7 +64,7 @@ func (mpl *mpListener) start() {
 					case <-mpl.chClose:
 						return
 					default:
-						log.Debugf("failed to accept on %s: %v", l.Addr(), err)
+						// log.Debugf("failed to accept on %s: %v", l.Addr(), err)
 					}
 				}
 			}
