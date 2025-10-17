@@ -264,7 +264,7 @@ func (sf *subflow) sendLoop() {
 func (sf *subflow) ack(fn uint64) {
 	if sf == nil {
 		// This should only ever happen in testing.
-		log.Debugf("Nil subflow requested to do an ack! (should only happen on tests)")
+		// log.Debugf("Nil subflow requested to do an ack! (should only happen on tests)")
 		return
 	}
 
