@@ -26,19 +26,114 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y gcc
     
-    - name: Run tests
-      run: go test -v -timeout 30s -run "TestCongestionControl|TestFlowControl|TestEnhancedStatsTracker|TestReceiveQueue"
+    - name: Run tests with coverage and race detection
+      run: CGO_ENABLED=1 go test -v -race -coverprofile=coverage.out -timeout 30s -run "TestCongestionControl|TestFlowControl|TestEnhancedStatsTracker|TestReceiveQueue"
     
-    - name: Run tests with race detection
-      run: CGO_ENABLED=1 go test -v -race -timeout 30s -run "TestCongestionControl|TestFlowControl|TestEnhancedStatsTracker|TestReceiveQueue"
+    - name: Generate HTML coverage report
+      run: go tool cover -html=coverage.out -o coverage.html
+    
+    - name: Generate coverage summary
+      run: go tool cover -func=coverage.out > coverage.txt
+    
+    - name: Generate JUnit test report
+      run: |
+        CGO_ENABLED=1 go test -v -json -race -timeout 30s -run "TestCongestionControl|TestFlowControl|TestEnhancedStatsTracker|TestReceiveQueue" > test-results.json || true
+        # Convert JSON to JUnit XML format
+        echo '<?xml version="1.0" encoding="UTF-8"?>' > test-results.xml
+        echo '<testsuites>' >> test-results.xml
+        echo '  <testsuite name="multipath" tests="$(grep -c "Test": test-results.json)" failures="$(grep -c "Action":"fail" test-results.json)" time="$(grep "Elapsed" test-results.json | tail -1 | cut -d: -f2 | tr -d ' ' | cut -d. -f1)">' >> test-results.xml
+        grep '"Test":' test-results.json | while read line; do
+          test_name=$(echo "$line" | cut -d'"' -f4)
+          echo "    <testcase name=\"$test_name\" classname=\"multipath\"/>" >> test-results.xml
+        done
+        echo '  </testsuite>' >> test-results.xml
+        echo '</testsuites>' >> test-results.xml
 
-    - name: Run tests with coverage
-      run: go test -v -coverprofile=coverage.out -timeout 30s -run "TestCongestionControl|TestFlowControl|TestEnhancedStatsTracker|TestReceiveQueue"
-    
-    - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v3
+    - name: Upload coverage reports as artifacts
+      uses: actions/upload-artifact@v4
       with:
-        file: ./coverage.out
-        flags: unittests
-        name: codecov-umbrella
-        fail_ci_if_error: false
+        name: coverage-reports
+        path: |
+          coverage.out
+          coverage.html
+          coverage.txt
+        retention-days: 30
+
+    - name: Upload test results as artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-results
+        path: |
+          test-results.json
+          test-results.xml
+        retention-days: 30
+
+    - name: Publish Test Results
+      uses: dorny/test-reporter@v1
+      if: success() || failure()
+      with:
+        name: Multipath Tests
+        path: test-results.xml
+        reporter: java-junit
+
+    - name: Comment Coverage Report
+      uses: actions/github-script@v7
+      if: github.event_name == 'pull_request'
+      with:
+        script: |
+          const fs = require('fs');
+          const coverage = fs.readFileSync('coverage.txt', 'utf8');
+          const totalLine = coverage.split('\n').find(line => line.includes('total:'));
+          const coveragePercent = totalLine ? totalLine.split(/\s+/).pop() : 'Unknown';
+          
+          const comment = `## 📊 Test Coverage Report
+          
+          **Coverage:** ${coveragePercent}
+          
+          <details>
+          <summary>📈 Detailed Coverage Report</summary>
+          
+          \`\`\`
+          ${coverage}
+          \`\`\`
+          </details>
+          
+          📁 **Artifacts Available:**
+          - \`coverage.html\` - Visual coverage report
+          - \`coverage.out\` - Raw coverage data
+          - \`test-results.xml\` - JUnit test results
+          - \`test-results.json\` - JSON test results
+          
+          Download from the [Actions artifacts](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}) section.`;
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: comment
+          });
+
+    - name: Create Coverage Badge
+      run: |
+        # Extract coverage percentage
+        COVERAGE=$(grep "total:" coverage.txt | awk '{print $3}' | sed 's/%//')
+        echo "COVERAGE_PERCENTAGE=$COVERAGE" >> $GITHUB_ENV
+        
+        # Create a simple coverage badge
+        if [ "$COVERAGE" -ge 80 ]; then
+          COLOR="brightgreen"
+        elif [ "$COVERAGE" -ge 60 ]; then
+          COLOR="yellow"
+        else
+          COLOR="red"
+        fi
+        
+        echo "COVERAGE_COLOR=$COLOR" >> $GITHUB_ENV
+        echo "Coverage: $COVERAGE% (Color: $COLOR)" >> coverage-summary.txt
+
+    - name: Upload Coverage Summary
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-summary
+        path: coverage-summary.txt
+        retention-days: 30
