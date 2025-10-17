@@ -21,12 +21,17 @@ jobs:
     - name: Install dependencies
       run: go mod download
     
+    - name: Install build tools for CGO
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y gcc
+    
     - name: Run tests
       run: go test -v -timeout 30s -run "TestCongestionControl|TestFlowControl|TestEnhancedStatsTracker|TestReceiveQueue"
     
     - name: Run tests with race detection
-      run: go test -v -race -timeout 30s -run "TestCongestionControl|TestFlowControl|TestEnhancedStatsTracker|TestReceiveQueue"
-    
+      run: CGO_ENABLED=1 go test -v -race -timeout 30s -run "TestCongestionControl|TestFlowControl|TestEnhancedStatsTracker|TestReceiveQueue"
+
     - name: Run tests with coverage
       run: go test -v -coverprofile=coverage.out -timeout 30s -run "TestCongestionControl|TestFlowControl|TestEnhancedStatsTracker|TestReceiveQueue"
     
