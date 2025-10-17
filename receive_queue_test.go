@@ -208,12 +208,18 @@ func TestReceiveQueueBufferCorruption(t *testing.T) {
 	rq := newReceiveQueue(10)
 
 	// Manually set up buffer state to simulate corruption
+	// We need to be very careful about the order of operations to avoid race conditions
 	rq.readLock.Lock()
 	rq.buf[0] = rxFrame{fn: 10, bytes: []byte("hello")}
 	rq.buf[1] = rxFrame{fn: 12, bytes: []byte("world")} // Skip frame 11 to create gap
 	rq.rp = 0
 	// Set readFrameTip to 9 so that expected frame is 10, but we have 12
 	atomic.StoreUint64(&rq.readFrameTip, 9)
+	// Signal that data is available to avoid the read loop waiting
+	select {
+	case rq.availableFrameChannel <- true:
+	default:
+	}
 	rq.readLock.Unlock()
 
 	// Try to read - should detect corruption
