@@ -222,6 +222,9 @@ func TestReceiveQueueBufferCorruption(t *testing.T) {
 	}
 	rq.readLock.Unlock()
 
+	// Add a small delay to ensure all setup is complete before reading
+	time.Sleep(time.Millisecond * 10)
+
 	// Try to read - should detect corruption
 	buffer := make([]byte, 10)
 	_, err := rq.read(buffer)
