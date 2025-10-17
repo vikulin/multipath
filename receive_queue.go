@@ -91,32 +91,18 @@ func (rq *receiveQueue) add(f *rxFrame, sf *subflow) {
 }
 
 func (rq *receiveQueue) isFull() bool {
-	printFull := false
+	rq.readLock.Lock()
+	defer rq.readLock.Unlock()
+
+	// Count non-empty slots
+	nonEmptyCount := uint64(0)
 	for i := uint64(0); i < rq.size; i++ {
-		expectedFrameNumber := atomic.LoadUint64(&rq.readFrameTip) + i
-		idx := expectedFrameNumber % rq.size
-
-		rq.readLock.Lock()
-		if rq.buf[idx].fn != expectedFrameNumber {
-			if printFull {
-				log.Tracef("receiveQueue is %d%% full! (%d/%d)", int((float32(i) / float32(rq.size) * 100)), i, rq.size)
-			}
-			rq.readLock.Unlock()
-			return false
-		}
-
-		if rq.buf[idx].bytes == nil {
-			rq.readLock.Unlock()
-			return false
-		}
-		rq.readLock.Unlock()
-
-		if i == rq.size/2 {
-			printFull = true
+		if rq.buf[i].bytes != nil {
+			nonEmptyCount++
 		}
 	}
 
-	return true
+	return nonEmptyCount == rq.size
 }
 
 func (rq *receiveQueue) tryAdd(f *rxFrame) bool {
@@ -279,5 +265,3 @@ func (rq *receiveQueue) close() {
 		}
 	}
 }
-
-
