@@ -2,11 +2,13 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/vikulin/multipath"
 )
@@ -69,26 +71,42 @@ func handleConnection(conn net.Conn) {
 
 	fmt.Printf("New connection from %s\n", conn.RemoteAddr())
 
-	// Read data from client
-	buffer := make([]byte, 4096)
+	// Phase 1: Consume data from client (like /dev/null)
+	fmt.Println("Phase 1: Consuming data from client...")
+	buffer := make([]byte, 256*1024) // 256KB buffer
+	totalBytes := 0
+
 	for {
+		// Set read deadline to prevent hanging - very long timeout for large transfers
+		conn.SetReadDeadline(time.Now().Add(600 * time.Second)) // 10 minutes
 		n, err := conn.Read(buffer)
 		if err != nil {
-			if err.Error() != "EOF" {
+			if err == io.EOF {
+				fmt.Println("Client finished sending data")
+				break
+			}
+			// Check if it's a normal connection close
+			errMsg := err.Error()
+			if errMsg != "use of closed network connection" &&
+				errMsg != "closed connection" {
 				log.Printf("Read error: %v", err)
 			}
 			break
 		}
 
-		// Echo data back
-		_, err = conn.Write(buffer[:n])
-		if err != nil {
-			log.Printf("Write error: %v", err)
-			break
+		// Just consume the data - don't store it anywhere (like /dev/null)
+		// The data is read into buffer but we don't do anything with it
+		totalBytes += n
+
+		// Progress indicator for large transfers
+		if totalBytes%(100*1024*1024) == 0 { // Every 100MB
+			fmt.Printf("Consumed %d MB so far...\n", totalBytes/(1024*1024))
 		}
 
-		fmt.Printf("Echoed %d bytes\n", n)
+		// Reset read deadline after successful operation - keep connection alive
+		conn.SetReadDeadline(time.Now().Add(600 * time.Second))
 	}
 
-	fmt.Printf("Connection from %s closed\n", conn.RemoteAddr())
+	fmt.Printf("Connection from %s closed (total: %d bytes)\n",
+		conn.RemoteAddr(), totalBytes)
 }

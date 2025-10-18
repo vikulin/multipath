@@ -192,6 +192,15 @@ func (sf *subflow) sendLoop() {
 				closeCountdown.Reset(time.Millisecond * 33)
 			}
 
+			// Quick check if frame is already released before acquiring lock
+			if atomic.LoadInt32(frame.released) == 1 {
+				select {
+				case sf.mpc.writerMaybeReady <- true:
+				default:
+				}
+				continue
+			}
+
 			frame.changeLock.Lock()
 			if frame.retransmissions != 0 {
 				log.Tracef("Retransmit on %d, for the %dth time", frame.fn, frame.retransmissions)
@@ -214,6 +223,18 @@ func (sf *subflow) sendLoop() {
 				frame.sentVia = append(frame.sentVia, transmissionDatapoint{sf, time.Now()})
 			}
 
+			// Check if frame buffer is valid before proceeding
+			if len(frame.buf) == 0 {
+				log.Errorf("Frame buffer is empty for frame %d, skipping", frame.fn)
+				frame.changeLock.Unlock()
+				continue
+			}
+
+			// Store buffer length and data before releasing the lock
+			bufLen := len(frame.buf)
+			bufData := make([]byte, bufLen)
+			copy(bufData, frame.buf)
+
 			sf.addPendingAck(frame)
 			frame.changeLock.Unlock()
 
@@ -222,7 +243,7 @@ func (sf *subflow) sendLoop() {
 
 			// Set write deadline to prevent hanging
 			sf.conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-			n, err := sf.conn.Write(frame.buf)
+			n, err := sf.conn.Write(bufData)
 
 			atomic.StoreUint64(&sf.actuallyBusyOnWrite, 0)
 
@@ -246,8 +267,8 @@ func (sf *subflow) sendLoop() {
 				}
 
 				// Handle partial writes
-				if n != 0 && n != len(frame.buf) {
-					log.Tracef("Partial write: expected %d bytes, written %d", len(frame.buf), n)
+				if n != 0 && n != bufLen {
+					log.Tracef("Partial write: expected %d bytes, written %d", bufLen, n)
 					// This is a serious error, close the subflow
 					sf.close()
 					return
@@ -258,8 +279,8 @@ func (sf *subflow) sendLoop() {
 			}
 
 			// Validate write completion
-			if n != len(frame.buf) {
-				log.Errorf("Incomplete write: expected %d bytes, written %d on %s", len(frame.buf), n, sf.to)
+			if n != bufLen {
+				log.Errorf("Incomplete write: expected %d bytes, written %d on %s", bufLen, n, sf.to)
 				sf.close()
 				return
 			}

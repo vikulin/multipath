@@ -161,6 +161,8 @@ func (f *sendFrame) release() {
 			pool.Put(f.buf)
 			f.buf = nil // Prevent double-free
 		}
+		// Also clear the size to prevent processing
+		f.sz = 0
 	}
 }
 

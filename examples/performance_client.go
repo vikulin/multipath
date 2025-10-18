@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"sync/atomic"
@@ -15,11 +16,11 @@ func main() {
 	// Create custom stats tracker
 	statsTracker := &performanceTracker{}
 
-	// Create individual dialers for different paths
+	// Create individual dialers for different paths with stats
 	dialers := []multipath.Dialer{
-		&tcpDialer{addr: "localhost:8080"},
-		&tcpDialer{addr: "localhost:8081"},
-		&tcpDialer{addr: "localhost:8082"},
+		&tcpDialer{addr: "localhost:8080", stats: statsTracker},
+		&tcpDialer{addr: "localhost:8081", stats: statsTracker},
+		&tcpDialer{addr: "localhost:8082", stats: statsTracker},
 	}
 
 	// Create multipath dialer
@@ -40,52 +41,111 @@ func main() {
 	// Start performance monitoring
 	go statsTracker.monitorPerformance()
 
-	// Send large data for performance testing
-	dataSize := 1024 * 1024 // 1MB
-	testData := make([]byte, dataSize)
-	for i := range testData {
-		testData[i] = byte(i % 256)
-	}
+	// Test 10GB transfer only
+	testSize := int64(10 * 1024 * 1024 * 1024) // 10GB
 
-	fmt.Printf("Sending %d bytes of test data...\n", dataSize)
+	fmt.Printf("\n=== Testing 10GB Transfer ===\n")
+	fmt.Printf("Sending %d bytes of test data...\n", testSize)
 
 	start := time.Now()
 
-	// Send data
-	_, err = conn.Write(testData)
-	if err != nil {
-		log.Fatalf("Write error: %v", err)
+	// Simple direct upload - just send random data
+	fmt.Println("Phase 1: Uploading data to server...")
+
+	// Create a small buffer of random data that server can handle
+	bufferSize := int64(64 * 1024) // 64KB buffer - race condition fixed
+	randomData := make([]byte, bufferSize)
+	for i := range randomData {
+		randomData[i] = byte(i % 256)
 	}
 
-	// Read response
-	response := make([]byte, dataSize)
-	_, err = conn.Read(response)
-	if err != nil {
-		log.Fatalf("Read error: %v", err)
+	bytesProcessed := int64(0)
+	for bytesProcessed < testSize {
+		// Send the buffer directly
+		conn.SetWriteDeadline(time.Now().Add(300 * time.Second)) // 5 minutes
+		_, err := conn.Write(randomData)
+		if err != nil {
+			if err == io.EOF {
+				fmt.Println("Server closed connection during upload")
+				break
+			}
+			log.Fatalf("Write error: %v", err)
+		}
+
+		bytesProcessed += bufferSize
+
+		// Progress indicator every 100MB
+		if bytesProcessed%(100*1024*1024) == 0 {
+			progress := float64(bytesProcessed) / float64(testSize) * 100
+			fmt.Printf("Upload Progress: %.1f%% (%d/%d bytes)\n", progress, bytesProcessed, testSize)
+		}
 	}
+
+	// Close write side to signal end of upload
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		tcpConn.CloseWrite()
+	}
+
+	fmt.Println("Upload completed!")
 
 	duration := time.Since(start)
-	throughput := float64(dataSize) / duration.Seconds()
+	throughput := float64(testSize) / duration.Seconds()
 
 	fmt.Printf("Transfer completed in %v\n", duration)
-	fmt.Printf("Throughput: %.2f MB/sec\n", throughput/(1024*1024))
+	fmt.Printf("Throughput: %.2f MB/sec (%.2f GB/sec)\n",
+		throughput/(1024*1024), throughput/(1024*1024*1024))
+	fmt.Printf("Data rate: %.2f Mbps\n", throughput*8/(1024*1024))
 
 	// Print final stats
+	fmt.Println("\n=== Final Performance Stats ===")
 	statsTracker.printStats()
 }
 
 // Custom dialer implementation
 type tcpDialer struct {
-	addr string
+	addr  string
+	stats *performanceTracker
 }
 
 func (d *tcpDialer) DialContext(ctx context.Context) (net.Conn, error) {
 	var dialer net.Dialer
-	return dialer.DialContext(ctx, "tcp", d.addr)
+	conn, err := dialer.DialContext(ctx, "tcp", d.addr)
+	if err != nil {
+		return nil, err
+	}
+
+	// Wrap the connection to track stats
+	return &trackedConn{Conn: conn, stats: d.stats}, nil
 }
 
 func (d *tcpDialer) Label() string {
 	return fmt.Sprintf("TCP dialer to %s", d.addr)
+}
+
+// Tracked connection wrapper
+type trackedConn struct {
+	net.Conn
+	stats         *performanceTracker
+	lastWriteTime time.Time
+}
+
+func (tc *trackedConn) Read(b []byte) (n int, err error) {
+	n, err = tc.Conn.Read(b)
+	if n > 0 {
+		tc.stats.OnRecv(uint64(n))
+		// Simple RTT measurement - just set a small value for localhost
+		tc.stats.UpdateRTT(100 * time.Microsecond)
+	}
+	return n, err
+}
+
+func (tc *trackedConn) Write(b []byte) (n int, err error) {
+	tc.lastWriteTime = time.Now()
+	n, err = tc.Conn.Write(b)
+	if n > 0 {
+		tc.stats.OnSent(uint64(n))
+	}
+	return n, err
 }
 
 // Performance tracker
