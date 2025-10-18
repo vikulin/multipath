@@ -230,10 +230,8 @@ func (sf *subflow) sendLoop() {
 				continue
 			}
 
-			// Store buffer length and data before releasing the lock
+			// Store buffer length before releasing the lock
 			bufLen := len(frame.buf)
-			bufData := make([]byte, bufLen)
-			copy(bufData, frame.buf)
 
 			sf.addPendingAck(frame)
 			frame.changeLock.Unlock()
@@ -243,7 +241,7 @@ func (sf *subflow) sendLoop() {
 
 			// Set write deadline to prevent hanging
 			sf.conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-			n, err := sf.conn.Write(bufData)
+			n, err := sf.conn.Write(frame.buf)
 
 			atomic.StoreUint64(&sf.actuallyBusyOnWrite, 0)
 
