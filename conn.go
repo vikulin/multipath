@@ -1,12 +1,23 @@
 package multipath
 
 import (
+	"context"
 	"net"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// failedSubflowInfo tracks information about failed subflows for recovery
+type failedSubflowInfo struct {
+	address          string
+	dialer           Dialer
+	lastFailure      time.Time
+	recoveryAttempts int
+	nextAttempt      time.Time
+	originalLabel    string
+}
 
 type mpConn struct {
 	cid              connectionID
@@ -21,6 +32,13 @@ type mpConn struct {
 
 	pendingAckMap map[uint64]*pendingAck
 	pendingAckMu  *sync.RWMutex
+
+	// Dynamic subflow management
+	failedSubflows   map[string]*failedSubflowInfo // Track failed subflows by address
+	recoveryTicker   *time.Ticker                  // Periodic recovery attempts
+	muFailedSubflows sync.RWMutex                  // Mutex for failed subflows
+	originalDialers  []Dialer                      // Store original dialers for reconnection
+	recoveryEnabled  bool                          // Enable/disable recovery
 }
 
 func newMPConn(cid connectionID, remoteAddr net.Addr) *mpConn {
@@ -33,9 +51,12 @@ func newMPConn(cid connectionID, remoteAddr net.Addr) *mpConn {
 		tryRetransmit:    make(chan bool, 1),
 		pendingAckMap:    make(map[uint64]*pendingAck),
 		pendingAckMu:     &sync.RWMutex{},
+		failedSubflows:   make(map[string]*failedSubflowInfo),
+		recoveryEnabled:  true,
 	}
 	go mpc.retransmitLoop()
 	go mpc.startHealthMonitoring()
+	go mpc.startRecoveryMonitoring()
 	return mpc
 }
 
@@ -255,6 +276,13 @@ func (bc *mpConn) add(to string, c net.Conn, clientSide bool, probeStart time.Ti
 	bc.subflows = append(bc.subflows, startSubflow(to, c, bc, clientSide, probeStart, tracker))
 }
 
+// setOriginalDialers stores the original dialers for recovery purposes
+func (bc *mpConn) setOriginalDialers(dialers []Dialer) {
+	bc.muFailedSubflows.Lock()
+	defer bc.muFailedSubflows.Unlock()
+	bc.originalDialers = dialers
+}
+
 func (bc *mpConn) remove(theSubflow *subflow) {
 	bc.muSubflows.Lock()
 	var remains []*subflow
@@ -331,7 +359,7 @@ func (bc *mpConn) isPendingAck(fn uint64) bool {
 func (bc *mpConn) startHealthMonitoring() {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
-	
+
 	for range ticker.C {
 		if atomic.LoadUint32(&bc.closed) == 1 {
 			return
@@ -346,28 +374,156 @@ func (bc *mpConn) checkSubflowHealth() {
 	subflows := make([]*subflow, len(bc.subflows))
 	copy(subflows, bc.subflows)
 	bc.muSubflows.RUnlock()
-	
+
 	for _, sf := range subflows {
 		// Check for stale subflows (no activity for too long)
 		timeSinceActivity := time.Since(sf.lastActivity)
-		if timeSinceActivity > 60*time.Second {
-			log.Debugf("Subflow %s appears stale (no activity for %v), closing", sf.to, timeSinceActivity)
-			go sf.close()
+		if timeSinceActivity > 12*time.Second {
+			log.Debugf("Subflow %s appears stale (no activity for %v), marking for recovery", sf.to, timeSinceActivity)
+			bc.markSubflowAsFailed(sf, "stale")
 			continue
 		}
-		
+
 		// Check for subflows with very low success rates
 		successRate := sf.getSuccessRate()
 		if successRate < 0.1 && timeSinceActivity > 30*time.Second {
-			log.Debugf("Subflow %s has very low success rate (%.2f), closing", sf.to, successRate)
-			go sf.close()
+			log.Debugf("Subflow %s has very low success rate (%.2f), marking for recovery", sf.to, successRate)
+			bc.markSubflowAsFailed(sf, "low_success_rate")
 			continue
 		}
-		
+
 		// Log health status for debugging
 		if timeSinceActivity > 30*time.Second {
-			log.Tracef("Subflow %s health: success rate=%.2f, last activity=%v ago", 
+			log.Tracef("Subflow %s health: success rate=%.2f, last activity=%v ago",
 				sf.to, successRate, timeSinceActivity)
 		}
+	}
+}
+
+// startRecoveryMonitoring starts the recovery monitoring goroutine
+func (bc *mpConn) startRecoveryMonitoring() {
+	if !bc.recoveryEnabled {
+		return
+	}
+
+	bc.recoveryTicker = time.NewTicker(5 * time.Second)
+	defer bc.recoveryTicker.Stop()
+
+	for range bc.recoveryTicker.C {
+		if atomic.LoadUint32(&bc.closed) == 1 {
+			return
+		}
+		bc.attemptRecovery()
+	}
+}
+
+// markSubflowAsFailed marks a subflow as failed and schedules it for recovery
+func (bc *mpConn) markSubflowAsFailed(sf *subflow, reason string) {
+	bc.muFailedSubflows.Lock()
+	defer bc.muFailedSubflows.Unlock()
+
+	// Find the corresponding dialer for this subflow
+	var dialer Dialer
+	for _, d := range bc.originalDialers {
+		if d.Label() == sf.to {
+			dialer = d
+			break
+		}
+	}
+
+	if dialer == nil {
+		log.Debugf("No dialer found for failed subflow %s, cannot recover", sf.to)
+		go sf.close()
+		return
+	}
+
+	// Add to failed subflows for recovery
+	bc.failedSubflows[sf.to] = &failedSubflowInfo{
+		address:          sf.to,
+		dialer:           dialer,
+		lastFailure:      time.Now(),
+		recoveryAttempts: 0,
+		nextAttempt:      time.Now().Add(5 * time.Second), // First attempt in 5 seconds
+		originalLabel:    sf.to,
+	}
+
+	log.Debugf("Marked subflow %s as failed (reason: %s), will attempt recovery in 5s", sf.to, reason)
+
+	// Close the current subflow
+	go sf.close()
+}
+
+// attemptRecovery attempts to recover failed subflows
+func (bc *mpConn) attemptRecovery() {
+	bc.muFailedSubflows.Lock()
+	defer bc.muFailedSubflows.Unlock()
+
+	now := time.Now()
+	for _, failedInfo := range bc.failedSubflows {
+		if now.Before(failedInfo.nextAttempt) {
+			continue // Not time for this subflow yet
+		}
+
+		// Attempt reconnection
+		go bc.reconnectSubflow(failedInfo)
+	}
+}
+
+// reconnectSubflow attempts to reconnect a failed subflow
+func (bc *mpConn) reconnectSubflow(failedInfo *failedSubflowInfo) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	log.Debugf("Attempting to reconnect subflow %s (attempt %d)", failedInfo.address, failedInfo.recoveryAttempts+1)
+
+	// Try to dial the failed subflow
+	conn, err := failedInfo.dialer.DialContext(ctx)
+	if err != nil {
+		bc.handleReconnectionFailure(failedInfo, err)
+		return
+	}
+
+	// Connection successful, add it back as a subflow
+	bc.muFailedSubflows.Lock()
+	delete(bc.failedSubflows, failedInfo.address)
+	bc.muFailedSubflows.Unlock()
+
+	// Create a new subflow
+	probeStart := time.Now()
+	tracker := &NullTracker{} // Use null tracker for recovered subflows
+	bc.add(failedInfo.address, conn, true, probeStart, tracker)
+
+	log.Debugf("Successfully recovered subflow %s", failedInfo.address)
+}
+
+// handleReconnectionFailure handles failed reconnection attempts
+func (bc *mpConn) handleReconnectionFailure(failedInfo *failedSubflowInfo, err error) {
+	bc.muFailedSubflows.Lock()
+	defer bc.muFailedSubflows.Unlock()
+
+	failedInfo.recoveryAttempts++
+	failedInfo.lastFailure = time.Now()
+
+	// Exponential backoff: 5s, 15s, 30s, 60s, then every 60s
+	backoffDuration := 5 * time.Second
+	if failedInfo.recoveryAttempts > 1 {
+		backoffDuration = 15 * time.Second
+	}
+	if failedInfo.recoveryAttempts > 2 {
+		backoffDuration = 30 * time.Second
+	}
+	if failedInfo.recoveryAttempts > 3 {
+		backoffDuration = 60 * time.Second
+	}
+
+	failedInfo.nextAttempt = time.Now().Add(backoffDuration)
+
+	log.Debugf("Reconnection failed for %s (attempt %d): %v, next attempt in %v",
+		failedInfo.address, failedInfo.recoveryAttempts, err, backoffDuration)
+
+	// Give up after 10 attempts (about 10 minutes)
+	if failedInfo.recoveryAttempts >= 10 {
+		log.Debugf("Giving up on subflow %s after %d failed attempts", failedInfo.address, failedInfo.recoveryAttempts)
+		delete(bc.failedSubflows, failedInfo.address)
 	}
 }

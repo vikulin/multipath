@@ -493,7 +493,7 @@ func (sf *subflow) getHealthScore() float64 {
 
 	// Apply activity penalty only for very inactive subflows
 	activityMultiplier := 1.0
-	if timeSinceActivity > 60*time.Second {
+	if timeSinceActivity > 12*time.Second {
 		activityMultiplier = 0.1 // Heavy penalty for very inactive subflows
 	} else if timeSinceActivity > 30*time.Second {
 		activityMultiplier = 0.5 // Moderate penalty for inactive subflows

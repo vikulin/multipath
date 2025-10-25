@@ -105,6 +105,13 @@ func (mpd *mpDialer) DialContext(ctx context.Context) (net.Conn, error) {
 		}
 		if cid == zeroCID {
 			bc = newMPConn(newCID, conn.RemoteAddr())
+			// Set original dialers for recovery
+			subflowDialers := mpd.sorted()
+			dialers := make([]Dialer, len(subflowDialers))
+			for i, sd := range subflowDialers {
+				dialers[i] = sd.Dialer
+			}
+			bc.setOriginalDialers(dialers)
 			go func() {
 				for {
 					time.Sleep(time.Second)
