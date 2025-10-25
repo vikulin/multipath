@@ -458,66 +458,66 @@ func (im *InterfaceMonitor) isAddressUsableForOutgoing(address string) bool {
 		return false
 	}
 
-	// Skip loopback addresses for outgoing connections
+	// Skip loopback addresses for outgoing connections (these are for local communication only)
 	if ip.IsLoopback() {
 		return false
 	}
 
-	// Skip link-local addresses (they're not routable)
+	// Skip link-local addresses (these are only for same-link communication)
 	if ip.IsLinkLocalUnicast() {
 		return false
 	}
 
-	// Skip multicast addresses
+	// Skip multicast addresses (these are for group communication, not point-to-point)
 	if ip.IsMulticast() {
 		return false
 	}
 
-	// For IPv6, skip some special addresses
+	// For IPv6, skip link-local addresses (fe80::/10) - these are only for same-link communication
 	if ip.To4() == nil { // IPv6
-		// Skip IPv6 link-local addresses (fe80::/10)
 		if len(ip) == 16 && ip[0] == 0xfe && (ip[1]&0xc0) == 0x80 {
 			return false
 		}
-		// Skip unique local addresses (fc00::/7) - these are not globally routable
-		if len(ip) == 16 && ip[0] == 0xfc {
-			return false
-		}
+		// Note: We now allow unique local addresses (fc00::/7) as they can be used behind NAT
 	}
 
-	// For IPv4, skip some problematic ranges
-	if ip.To4() != nil {
-		// Skip virtual machine host-only networks (192.168.x.x ranges that might not be routable)
-		// Skip Docker networks (172.16.x.x - 172.31.x.x)
-		ip4 := ip.To4()
-		if ip4[0] == 172 && ip4[1] >= 16 && ip4[1] <= 31 {
-			return false
-		}
-		// Skip some virtual network ranges that might not be usable for binding
-		if ip4[0] == 192 && ip4[1] == 168 {
-			// Only allow common private ranges that are likely to be usable
-			// Skip 192.168.56.x (VirtualBox), 192.168.100.x (some VMs)
-			if ip4[2] == 56 || ip4[2] == 100 {
-				return false
-			}
-		}
-	}
+	// For IPv4, we now allow all private ranges as they can be used behind NAT:
+	// - 10.0.0.0/8 (Class A private)
+	// - 172.16.0.0/12 (Class B private)
+	// - 192.168.0.0/16 (Class C private)
+	// These are all valid for outgoing connections when behind NAT
 
-	// Try to create a test connection to see if the address is actually usable
-	// This is a more thorough check but might be expensive
-	return im.testAddressUsability(address)
+	// For now, assume all non-loopback, non-link-local, non-multicast addresses are usable
+	// The runtime test was too aggressive and rejected valid addresses behind NAT
+	return true
 }
 
 // testAddressUsability performs a quick test to see if an address can be used for outgoing connections
 func (im *InterfaceMonitor) testAddressUsability(address string) bool {
+	// Parse the address to determine the appropriate test destination
+	ip := net.ParseIP(address)
+	if ip == nil {
+		return false
+	}
+
+	var testDest string
+	if ip.To4() != nil {
+		// For IPv4, try to connect to a public DNS server (8.8.8.8:53)
+		// This tests if the address can reach external networks
+		testDest = "8.8.8.8:53"
+	} else {
+		// For IPv6, try to connect to a public IPv6 DNS server (2001:4860:4860::8888:53)
+		testDest = "[2001:4860:4860::8888]:53"
+	}
+
 	// Try to create a test dialer with this local address
 	testDialer := &boundDialer{
 		localAddr:  address,
-		serverAddr: "127.0.0.1:1", // Use a non-existent local address for testing
+		serverAddr: testDest,
 	}
 
 	// Try to create the dialer (this will fail at connection time, but we can check if the local address is valid)
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
 	_, err := testDialer.DialContext(ctx)
@@ -530,10 +530,11 @@ func (im *InterfaceMonitor) testAddressUsability(address string) bool {
 		if strings.Contains(errStr, "not valid") ||
 			strings.Contains(errStr, "invalid") ||
 			strings.Contains(errStr, "cannot assign") ||
-			strings.Contains(errStr, "no such device") {
+			strings.Contains(errStr, "no such device") ||
+			strings.Contains(errStr, "no route to host") {
 			return false
 		}
-		// Other errors (like connection refused) are expected and mean the address is valid
+		// Other errors (like connection refused, timeout, etc.) are expected and mean the address is valid
 		return true
 	}
 
