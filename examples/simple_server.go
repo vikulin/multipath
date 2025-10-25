@@ -71,14 +71,12 @@ func handleConnection(conn net.Conn) {
 
 	fmt.Printf("New connection from %s\n", conn.RemoteAddr())
 
-	// Phase 1: Consume data from client (like /dev/null)
-	fmt.Println("Phase 1: Consuming data from client...")
-	buffer := make([]byte, 256*1024) // 256KB buffer
-	totalBytes := 0
+	// Echo server - read and echo back data
+	buffer := make([]byte, 1024) // 1KB buffer for messages
 
 	for {
-		// Set read deadline to prevent hanging - very long timeout for large transfers
-		conn.SetReadDeadline(time.Now().Add(600 * time.Second)) // 10 minutes
+		// Set read deadline to prevent hanging
+		conn.SetReadDeadline(time.Now().Add(30 * time.Second)) // 30 second timeout
 		n, err := conn.Read(buffer)
 		if err != nil {
 			if err == io.EOF {
@@ -94,19 +92,15 @@ func handleConnection(conn net.Conn) {
 			break
 		}
 
-		// Just consume the data - don't store it anywhere (like /dev/null)
-		// The data is read into buffer but we don't do anything with it
-		totalBytes += n
-
-		// Progress indicator for large transfers
-		if totalBytes%(100*1024*1024) == 0 { // Every 100MB
-			fmt.Printf("Consumed %d MB so far...\n", totalBytes/(1024*1024))
+		// Echo back the data
+		_, writeErr := conn.Write(buffer[:n])
+		if writeErr != nil {
+			log.Printf("Write error: %v", writeErr)
+			break
 		}
 
-		// Reset read deadline after successful operation - keep connection alive
-		conn.SetReadDeadline(time.Now().Add(600 * time.Second))
+		fmt.Printf("Echoed %d bytes\n", n)
 	}
 
-	fmt.Printf("Connection from %s closed (total: %d bytes)\n",
-		conn.RemoteAddr(), totalBytes)
+	fmt.Printf("Connection from %s closed\n", conn.RemoteAddr())
 }
