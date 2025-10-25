@@ -35,6 +35,14 @@ type subflow struct {
 	tracker             StatsTracker
 	actuallyBusyOnWrite uint64
 	finishedClosing     chan bool
+
+	// Throughput tracking
+	bytesSent     uint64
+	bytesReceived uint64
+	lastActivity  time.Time
+	successCount  uint64
+	failureCount  uint64
+	muStats       sync.RWMutex
 }
 
 func startSubflow(to string, c net.Conn, mpc *mpConn, clientSide bool, probeStart time.Time, tracker StatsTracker) *subflow {
@@ -46,9 +54,10 @@ func startSubflow(to string, c net.Conn, mpc *mpConn, clientSide bool, probeStar
 		sendQueue:       make(chan *sendFrame, 1),
 		finishedClosing: make(chan bool, 1),
 		// pendingPing is used for storing the subflow's ping data. Handy since pings are subflow dependent
-		pendingPing: nil,
-		emaRTT:      ema.NewDuration(longRTT, rttAlpha),
-		tracker:     tracker,
+		pendingPing:  nil,
+		emaRTT:       ema.NewDuration(longRTT, rttAlpha),
+		tracker:      tracker,
+		lastActivity: time.Now(),
 	}
 	go sf.sendLoop()
 	if clientSide {
@@ -141,6 +150,7 @@ func (sf *subflow) readLoopFrames(ch chan *rxFrame, r byteReader) bool {
 
 		ch <- &rxFrame{fn: fn, bytes: buf}
 		sf.tracker.OnRecv(sz)
+		sf.recordBytesReceived(sz)
 		select {
 		case <-sf.chClose:
 			return true
@@ -226,6 +236,7 @@ func (sf *subflow) sendLoop() {
 
 			if err != nil {
 				log.Debugf("failed to write frame %d to %s: %v", frame.fn, sf.to, err)
+				sf.recordFailure()
 
 				if frame.isDataFrame() {
 					go sf.mpc.retransmit(frame)
@@ -254,8 +265,11 @@ func (sf *subflow) sendLoop() {
 			frame.changeLock.Lock()
 			if frame.retransmissions == 0 {
 				sf.tracker.OnSent(frame.sz)
+				sf.recordBytesSent(frame.sz)
+				sf.recordSuccess()
 			} else {
 				sf.tracker.OnRetransmit(frame.sz)
+				sf.recordFailure()
 			}
 			frame.changeLock.Unlock()
 		}
@@ -390,4 +404,98 @@ func (sf *subflow) close() {
 
 func randomize(d time.Duration) time.Duration {
 	return d/2 + time.Duration(rand.Int63n(int64(d)))
+}
+
+// recordBytesSent records bytes sent for throughput calculation
+func (sf *subflow) recordBytesSent(bytes uint64) {
+	sf.muStats.Lock()
+	sf.bytesSent += bytes
+	sf.lastActivity = time.Now()
+	sf.muStats.Unlock()
+}
+
+// recordBytesReceived records bytes received for throughput calculation
+func (sf *subflow) recordBytesReceived(bytes uint64) {
+	sf.muStats.Lock()
+	sf.bytesReceived += bytes
+	sf.lastActivity = time.Now()
+	sf.muStats.Unlock()
+}
+
+// recordSuccess records a successful operation
+func (sf *subflow) recordSuccess() {
+	sf.muStats.Lock()
+	sf.successCount++
+	sf.lastActivity = time.Now()
+	sf.muStats.Unlock()
+}
+
+// recordFailure records a failed operation
+func (sf *subflow) recordFailure() {
+	sf.muStats.Lock()
+	sf.failureCount++
+	sf.muStats.Unlock()
+}
+
+// getSuccessRate calculates the success rate of this subflow
+func (sf *subflow) getSuccessRate() float64 {
+	sf.muStats.RLock()
+	defer sf.muStats.RUnlock()
+
+	total := sf.successCount + sf.failureCount
+	if total == 0 {
+		return 1.0 // Default to 100% success rate for new subflows
+	}
+	return float64(sf.successCount) / float64(total)
+}
+
+// getThroughput calculates the recent throughput in bytes per second
+func (sf *subflow) getThroughput() float64 {
+	sf.muStats.RLock()
+	defer sf.muStats.RUnlock()
+
+	// Calculate throughput based on recent activity
+	timeSinceActivity := time.Since(sf.lastActivity)
+	if timeSinceActivity > 30*time.Second {
+		return 0.0 // No recent activity
+	}
+
+	// Use a simple approach: if we have recent activity, assume good throughput
+	// This prevents subflows from being deprioritized during active transfers
+	if timeSinceActivity < 5*time.Second {
+		return 1000000.0 // 1MB/s baseline for active subflows
+	}
+
+	// For less recent activity, use a lower baseline
+	return 100000.0 // 100KB/s baseline
+}
+
+// getHealthScore calculates a composite health score for load balancing
+func (sf *subflow) getHealthScore() float64 {
+	rtt := sf.getRTT().Seconds()
+	if rtt == 0 {
+		rtt = 0.001 // Avoid division by zero
+	}
+
+	successRate := sf.getSuccessRate()
+	timeSinceActivity := time.Since(sf.lastActivity)
+
+	// Primary scoring based on RTT (inverse) - this is the most important factor
+	rttScore := 1.0 / rtt
+
+	// Apply success rate as a multiplier (0.5 to 1.5 range)
+	successMultiplier := 0.5 + successRate // Range: 0.5 to 1.5
+
+	// Apply activity penalty only for very inactive subflows
+	activityMultiplier := 1.0
+	if timeSinceActivity > 60*time.Second {
+		activityMultiplier = 0.1 // Heavy penalty for very inactive subflows
+	} else if timeSinceActivity > 30*time.Second {
+		activityMultiplier = 0.5 // Moderate penalty for inactive subflows
+	}
+
+	// Combine: RTT score * success multiplier * activity multiplier
+	score := rttScore * successMultiplier * activityMultiplier
+
+	return score
 }

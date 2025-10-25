@@ -179,8 +179,6 @@ func (bc *mpConn) retransmit(frame *sendFrame) {
 	if !alreadyTransmittedOnAllSubflows {
 		log.Debugf("frame %d is being retransmitted on all subflows of %x", frame.fn, bc.cid)
 	}
-
-	return
 }
 
 func selectSubflowForRetransmit(subflows []*subflow, frame *sendFrame, timeFallback bool) (bool, bool, *subflow) {
@@ -229,7 +227,23 @@ func (bc *mpConn) sortedSubflows() []*subflow {
 	copy(subflows, bc.subflows)
 	bc.muSubflows.RUnlock()
 	sort.Slice(subflows, func(i, j int) bool {
-		return subflows[i].getRTT() < subflows[j].getRTT()
+		// Primary sort by RTT (lower is better)
+		rttI := subflows[i].getRTT()
+		rttJ := subflows[j].getRTT()
+
+		// If RTTs are very close (within 10%), consider success rate as tiebreaker
+		if rttI > 0 && rttJ > 0 {
+			rttDiff := float64(rttI-rttJ) / float64(rttI+rttJ) * 2
+			if rttDiff < 0.1 && rttDiff > -0.1 {
+				// RTTs are close, use success rate as tiebreaker
+				successI := subflows[i].getSuccessRate()
+				successJ := subflows[j].getSuccessRate()
+				return successI > successJ
+			}
+		}
+
+		// Default to RTT-based sorting
+		return rttI < rttJ
 	})
 	return subflows
 }
@@ -259,9 +273,7 @@ func (bc *mpConn) remove(theSubflow *subflow) {
 func (bc *mpConn) retransmitLoop() {
 	evalTick := time.NewTicker(time.Millisecond * 100)
 	for {
-		select {
-		case <-evalTick.C:
-		}
+		<-evalTick.C
 		if atomic.LoadUint32(&bc.closed) == 1 {
 			return
 		}
