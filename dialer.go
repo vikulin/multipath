@@ -19,6 +19,7 @@ import (
 type Dialer interface {
 	DialContext(ctx context.Context) (net.Conn, error)
 	Label() string
+	GetServerAddr() net.Addr // Returns the server address this dialer connects to
 }
 
 // Stats is also provided by the multipath dialer so the caller can get and
@@ -70,6 +71,11 @@ func (sfd *subflowDialer) OnRetransmit(n uint64) {
 }
 func (sfd *subflowDialer) UpdateRTT(rtt time.Duration) {
 	sfd.emaRTT.UpdateDuration(rtt)
+}
+
+func (sfd *subflowDialer) GetServerAddr() net.Addr {
+	// Delegate to the embedded dialer
+	return sfd.Dialer.GetServerAddr()
 }
 
 type mpDialer struct {
@@ -184,6 +190,17 @@ func (mpd *mpDialer) handshake(conn net.Conn, cid connectionID) (connectionID, e
 
 func (mpd *mpDialer) Label() string {
 	return fmt.Sprintf("multipath dialer to %s with %d paths", mpd.dest, len(mpd.dialers))
+}
+
+func (mpd *mpDialer) GetServerAddr() net.Addr {
+	// Parse the destination string to create a net.Addr
+	// For now, assume it's a TCP address
+	addr, err := net.ResolveTCPAddr("tcp", mpd.dest)
+	if err != nil {
+		// If parsing fails, return nil (caller should handle this)
+		return nil
+	}
+	return addr
 }
 
 func (mpd *mpDialer) sorted() []*subflowDialer {

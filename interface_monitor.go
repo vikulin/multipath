@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -35,56 +33,6 @@ func convertAnetAddrs(addrs []net.Addr) []Addr {
 		result[i] = addr
 	}
 	return result
-}
-
-// Helper functions to avoid net package usage
-func (im *InterfaceMonitor) extractIPFromAddr(addrStr string) string {
-	// Handle CIDR notation (e.g., "192.168.1.1/24")
-	if idx := strings.Index(addrStr, "/"); idx != -1 {
-		return addrStr[:idx]
-	}
-	return addrStr
-}
-
-func (im *InterfaceMonitor) isLoopbackIP(ipStr string) bool {
-	return strings.HasPrefix(ipStr, "127.") || ipStr == "::1"
-}
-
-func (im *InterfaceMonitor) isLinkLocalIP(ipStr string) bool {
-	// IPv4 link-local: 169.254.0.0/16
-	if strings.HasPrefix(ipStr, "169.254.") {
-		return true
-	}
-	// IPv6 link-local: fe80::/10
-	if strings.HasPrefix(ipStr, "fe80:") {
-		return true
-	}
-	return false
-}
-
-func (im *InterfaceMonitor) isMulticastIP(ipStr string) bool {
-	// IPv4 multicast: 224.0.0.0/4
-	if strings.HasPrefix(ipStr, "224.") || strings.HasPrefix(ipStr, "225.") ||
-		strings.HasPrefix(ipStr, "226.") || strings.HasPrefix(ipStr, "227.") ||
-		strings.HasPrefix(ipStr, "228.") || strings.HasPrefix(ipStr, "229.") ||
-		strings.HasPrefix(ipStr, "230.") || strings.HasPrefix(ipStr, "231.") ||
-		strings.HasPrefix(ipStr, "232.") || strings.HasPrefix(ipStr, "233.") ||
-		strings.HasPrefix(ipStr, "234.") || strings.HasPrefix(ipStr, "235.") ||
-		strings.HasPrefix(ipStr, "236.") || strings.HasPrefix(ipStr, "237.") ||
-		strings.HasPrefix(ipStr, "238.") || strings.HasPrefix(ipStr, "239.") {
-		return true
-	}
-	// IPv6 multicast: ff00::/8
-	if strings.HasPrefix(ipStr, "ff") {
-		return true
-	}
-	return false
-}
-
-func (im *InterfaceMonitor) isValidIP(ipStr string) bool {
-	// Use net.ParseIP for validation since we're allowed to use net for parsing
-	ip := net.ParseIP(ipStr)
-	return ip != nil
 }
 
 // InterfaceMonitor monitors network interfaces for changes and manages dynamic subflows
@@ -353,22 +301,39 @@ func (im *InterfaceMonitor) addSubflowForAddress(address, interfaceName string) 
 	im.mpConn.muFailedSubflows.RUnlock()
 
 	if len(originalDialers) == 0 {
-		log.Debugf("No original dialers available for dynamic subflow creation")
+		// This is likely a server connection, which doesn't have original dialers
+		// Skip dynamic subflow creation for server connections
 		return
 	}
 
 	// Try to connect to each server address using the new local interface
 	for _, dialer := range originalDialers {
-		// Extract server address from dialer label
-		serverAddr := im.extractServerAddress(dialer.Label())
-		if serverAddr == "" {
+		// Get server address directly from dialer
+		serverAddr := dialer.GetServerAddr()
+		if serverAddr == nil {
 			continue
+		}
+
+		// Check if this is a self-connection (same machine)
+		// For self-connections, we should skip dynamic subflow creation
+		// because the original connections already provide the multipath functionality
+		// and adding more subflows requires proper multipath handshake protocol
+		serverHost, _, err := net.SplitHostPort(serverAddr.String())
+		if err == nil {
+			// Check for self-connection scenarios
+			if serverHost == address ||
+				serverHost == "localhost" ||
+				serverHost == "127.0.0.1" ||
+				serverHost == "::1" {
+				log.Debugf("Skipping dynamic subflow creation for self-connection: %s -> %s (requires proper multipath handshake)", address, serverAddr.String())
+				continue
+			}
 		}
 
 		// Create a new dialer that binds to the specific local address
 		localDialer := &boundDialer{
 			localAddr:  address,
-			serverAddr: serverAddr,
+			serverAddr: serverAddr.String(),
 		}
 
 		// Attempt to connect
@@ -389,65 +354,6 @@ func (im *InterfaceMonitor) addSubflowForAddress(address, interfaceName string) 
 
 		log.Debugf("Added new subflow for local address %s to server %s on interface %s", address, serverAddr, interfaceName)
 	}
-}
-
-// extractServerAddress extracts the server address from a dialer label
-func (im *InterfaceMonitor) extractServerAddress(label string) string {
-	// Try multiple common dialer label formats
-	patterns := []string{
-		"TCP dialer to ", // "TCP dialer to localhost:8080"
-		"dialer to ",     // "dialer to localhost:8080"
-		"tcp dialer to ", // "tcp dialer to localhost:8080"
-		"bound-dialer-",  // "bound-dialer-192.168.1.1->localhost:8080"
-		"dynamic-tcp-",   // "dynamic-tcp-localhost:8080"
-	}
-
-	for _, pattern := range patterns {
-		if len(label) > len(pattern) && label[:len(pattern)] == pattern {
-			address := label[len(pattern):]
-
-			// For bound-dialer format, extract the server part after "->"
-			if pattern == "bound-dialer-" {
-				if idx := strings.Index(address, "->"); idx != -1 {
-					address = address[idx+2:]
-				}
-			}
-
-			// Validate the extracted address
-			if im.isValidAddress(address) {
-				return address
-			}
-		}
-	}
-
-	// If no pattern matches, try to extract any address-like string
-	return im.extractAddressFromString(label)
-}
-
-// isValidAddress validates if the string looks like a valid network address
-func (im *InterfaceMonitor) isValidAddress(addr string) bool {
-	// Check if it contains a port (has colon and looks like host:port)
-	if strings.Contains(addr, ":") {
-		parts := strings.Split(addr, ":")
-		if len(parts) == 2 {
-			// Check if the port part is numeric
-			if _, err := strconv.Atoi(parts[1]); err == nil {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// extractAddressFromString tries to extract an address from any string
-func (im *InterfaceMonitor) extractAddressFromString(s string) string {
-	// Look for patterns like "host:port" in the string
-	re := regexp.MustCompile(`([a-zA-Z0-9.-]+):(\d+)`)
-	matches := re.FindStringSubmatch(s)
-	if len(matches) >= 3 {
-		return matches[0] // Return the full match (host:port)
-	}
-	return ""
 }
 
 // isAddressUsableForOutgoing checks if an address can be used for outgoing connections
@@ -572,8 +478,9 @@ func (d *boundDialer) DialContext(ctx context.Context) (net.Conn, error) {
 	var localAddr *net.TCPAddr
 	var err error
 
-	// Check if it's an IPv6 address (contains colons)
-	if strings.Contains(d.localAddr, ":") {
+	// Check if it's an IPv6 address (contains colons and not just one colon for port)
+	ip := net.ParseIP(d.localAddr)
+	if ip != nil && ip.To4() == nil {
 		// For IPv6, we need to wrap in brackets and add port
 		localAddr, err = net.ResolveTCPAddr("tcp", "["+d.localAddr+"]:0")
 	} else {
@@ -596,4 +503,14 @@ func (d *boundDialer) DialContext(ctx context.Context) (net.Conn, error) {
 
 func (d *boundDialer) Label() string {
 	return fmt.Sprintf("bound-dialer-%s->%s", d.localAddr, d.serverAddr)
+}
+
+func (d *boundDialer) GetServerAddr() net.Addr {
+	// Parse the server address string to create a net.Addr
+	addr, err := net.ResolveTCPAddr("tcp", d.serverAddr)
+	if err != nil {
+		// If parsing fails, return nil (caller should handle this)
+		return nil
+	}
+	return addr
 }
