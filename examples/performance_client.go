@@ -18,9 +18,9 @@ func main() {
 
 	// Create individual dialers for different paths with stats
 	dialers := []multipath.Dialer{
-		&tcpDialer{addr: "localhost:8080", stats: statsTracker},
-		&tcpDialer{addr: "localhost:8081", stats: statsTracker},
-		&tcpDialer{addr: "localhost:8082", stats: statsTracker},
+		&tcpDialer{addr: "192.168.11.11:8080", stats: statsTracker},
+		&tcpDialer{addr: "192.168.11.11:8081", stats: statsTracker},
+		&tcpDialer{addr: "192.168.11.11:8082", stats: statsTracker},
 	}
 
 	// Create multipath dialer
@@ -120,6 +120,16 @@ func (d *tcpDialer) DialContext(ctx context.Context) (net.Conn, error) {
 
 func (d *tcpDialer) Label() string {
 	return fmt.Sprintf("TCP dialer to %s", d.addr)
+}
+
+func (d *tcpDialer) GetServerAddr() net.Addr {
+	// Parse the address string to create a net.Addr
+	addr, err := net.ResolveTCPAddr("tcp", d.addr)
+	if err != nil {
+		// If parsing fails, return nil (caller should handle this)
+		return nil
+	}
+	return addr
 }
 
 // Tracked connection wrapper

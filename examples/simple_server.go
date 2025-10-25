@@ -14,11 +14,11 @@ import (
 )
 
 func main() {
-	// Create multiple TCP listeners on different ports
+	// Create multiple TCP listeners on different ports (listen on specific IP)
 	listeners := []net.Listener{
-		createListener(":8080"),
-		createListener(":8081"),
-		createListener(":8082"),
+		createListener("192.168.11.11:8080"),
+		createListener("192.168.11.11:8081"),
+		createListener("192.168.11.11:8082"),
 	}
 
 	// Create stats trackers (one per listener)

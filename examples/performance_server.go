@@ -14,11 +14,11 @@ import (
 )
 
 func main() {
-	// Create multiple TCP listeners on different ports
+	// Create multiple TCP listeners on different ports (listen on specific IP)
 	listeners := []net.Listener{
-		createListener(":8080"),
-		createListener(":8081"),
-		createListener(":8082"),
+		createListener("192.168.11.11:8080"),
+		createListener("192.168.11.11:8081"),
+		createListener("192.168.11.11:8082"),
 	}
 
 	// Create stats trackers (one per listener)
@@ -106,8 +106,8 @@ func handlePerformanceConnection(conn net.Conn) {
 			elapsed := now.Sub(startTime)
 			if elapsed > 0 {
 				throughput := float64(totalBytes) / elapsed.Seconds()
-				fmt.Printf("Consumed %d MB (%.2f MB/sec) - %s\n", 
-					totalBytes/(1024*1024), 
+				fmt.Printf("Consumed %d MB (%.2f MB/sec) - %s\n",
+					totalBytes/(1024*1024),
 					throughput/(1024*1024),
 					conn.RemoteAddr())
 			}
