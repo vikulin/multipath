@@ -134,6 +134,10 @@ func (sf *subflow) readLoopFrames(ch chan *rxFrame, r byteReader) bool {
 		}
 		if sz == 0 {
 			sf.gotACK(fn)
+			// Update activity when processing ACKs
+			sf.muStats.Lock()
+			sf.lastActivity = time.Now()
+			sf.muStats.Unlock()
 			continue
 		}
 		log.Tracef("got frame %d from %s with %d bytes", fn, sf.to, sz)
@@ -159,6 +163,10 @@ func (sf *subflow) readLoopFrames(ch chan *rxFrame, r byteReader) bool {
 		ch <- &rxFrame{fn: fn, bytes: buf}
 		sf.tracker.OnRecv(sz)
 		sf.recordBytesReceived(sz)
+		// Update activity when receiving frames
+		sf.muStats.Lock()
+		sf.lastActivity = time.Now()
+		sf.muStats.Unlock()
 		select {
 		case <-sf.chClose:
 			return true
@@ -559,4 +567,27 @@ func (sf *subflow) isDynamicSubflow() bool {
 // getCreatedAt returns when this subflow was created
 func (sf *subflow) getCreatedAt() time.Time {
 	return sf.createdAt
+}
+
+// isClosed checks if the subflow is closed
+func (sf *subflow) isClosed() bool {
+	select {
+	case <-sf.chClose:
+		return true
+	default:
+		return false
+	}
+}
+
+// getFailureRate returns the failure rate of this subflow
+func (sf *subflow) getFailureRate() float64 {
+	sf.muStats.RLock()
+	defer sf.muStats.RUnlock()
+
+	total := sf.successCount + sf.failureCount
+	if total == 0 {
+		return 0.0
+	}
+
+	return float64(sf.failureCount) / float64(total)
 }

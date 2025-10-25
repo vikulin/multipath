@@ -77,11 +77,13 @@ func (mpl *mpListener) acceptFrom(l net.Listener, st StatsTracker) error {
 	if err != nil {
 		return err
 	}
+
 	var leadBytes [leadBytesLength]byte
 	_, err = io.ReadFull(conn, leadBytes[:])
 	if err != nil {
 		return err
 	}
+
 	if uint8(leadBytes[0]) != 0 {
 		return ErrUnexpectedVersion
 	}
@@ -92,9 +94,6 @@ func (mpl *mpListener) acceptFrom(l net.Listener, st StatsTracker) error {
 		newConn = true
 		cid = connectionID(uuid.New())
 		copy(leadBytes[1:], cid[:])
-		log.Tracef("New connection from %v, assigned CID %x", conn.RemoteAddr(), cid)
-	} else {
-		log.Tracef("New subflow of CID %x from %v", cid, conn.RemoteAddr())
 	}
 	probeStart := time.Now()
 	// echo lead bytes back to the client
@@ -106,6 +105,9 @@ func (mpl *mpListener) acceptFrom(l net.Listener, st StatsTracker) error {
 	if !exists {
 		if newConn {
 			bc = newMPConn(cid, conn.RemoteAddr())
+			// Enable interface monitoring for server connections to support dynamic subflows
+			bc.interfaceEnabled = true
+			// Don't start interface monitoring yet - wait until first subflow is added
 			mpl.mpConns[cid] = bc
 		} else {
 			mpl.muMPConns.Unlock()
@@ -113,9 +115,28 @@ func (mpl *mpListener) acceptFrom(l net.Listener, st StatsTracker) error {
 		}
 	}
 	mpl.muMPConns.Unlock()
-	bc.add(fmt.Sprintf("%x(%s)", cid, conn.LocalAddr().String()), conn, false, probeStart, st)
+	subflowName := fmt.Sprintf("%x(%s)", cid, conn.LocalAddr().String())
+
+	// Add timeout to detect if bc.add() is hanging
+	done := make(chan bool, 1)
+	go func() {
+		bc.add(subflowName, conn, false, probeStart, st)
+		done <- true
+	}()
+
+	select {
+	case <-done:
+		// Subflow added successfully
+	case <-time.After(10 * time.Second):
+		return fmt.Errorf("timeout adding subflow %s", subflowName)
+	}
 	if newConn {
-		mpl.chNextAccepted <- bc
+		select {
+		case mpl.chNextAccepted <- bc:
+			// Connection sent to accept channel
+		case <-time.After(5 * time.Second):
+			// Timeout sending connection to accept channel
+		}
 	}
 	return nil
 }

@@ -2,6 +2,8 @@ package multipath
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"net"
 	"sort"
 	"sync"
@@ -66,7 +68,7 @@ func newMPConn(cid connectionID, remoteAddr net.Addr) *mpConn {
 	go mpc.retransmitLoop()
 	go mpc.startHealthMonitoring()
 	go mpc.startRecoveryMonitoring()
-	go mpc.startInterfaceMonitoring()
+	// Interface monitoring will be started after first subflow is added (for server connections)
 	return mpc
 }
 
@@ -87,8 +89,12 @@ func (bc *mpConn) Write(b []byte) (n int, err error) {
 			continue
 		}
 
-		for _, sf := range bc.sortedSubflows() {
+		bc.muSubflows.RLock()
+		subflows := make([]*subflow, len(bc.subflows))
+		copy(subflows, bc.subflows)
+		bc.muSubflows.RUnlock()
 
+		for _, sf := range subflows {
 			if atomic.LoadUint64(&sf.actuallyBusyOnWrite) == 1 {
 				// Avoid a possibly blocked writer for a retransmit
 				continue
@@ -100,7 +106,7 @@ func (bc *mpConn) Write(b []byte) (n int, err error) {
 			default:
 			}
 		}
-		if len(bc.sortedSubflows()) == 0 {
+		if len(subflows) == 0 {
 			return 0, ErrClosed
 		}
 
@@ -110,7 +116,14 @@ func (bc *mpConn) Write(b []byte) (n int, err error) {
 
 func (bc *mpConn) Close() error {
 	bc.close()
-	for _, sf := range bc.sortedSubflows() {
+
+	// Close all subflows
+	bc.muSubflows.RLock()
+	subflows := make([]*subflow, len(bc.subflows))
+	copy(subflows, bc.subflows)
+	bc.muSubflows.RUnlock()
+
+	for _, sf := range subflows {
 		sf.close()
 	}
 	return nil
@@ -119,6 +132,16 @@ func (bc *mpConn) Close() error {
 func (bc *mpConn) close() {
 	atomic.StoreUint32(&bc.closed, 1)
 	bc.recvQueue.close()
+
+	// Stop interface monitoring
+	if bc.interfaceMonitor != nil {
+		bc.interfaceMonitor.Stop()
+	}
+
+	// Stop recovery monitoring
+	if bc.recoveryTicker != nil {
+		bc.recoveryTicker.Stop()
+	}
 }
 
 type fakeAddr struct{}
@@ -167,7 +190,10 @@ func (bc *mpConn) retransmit(frame *sendFrame) {
 		atomic.StoreUint64(&frame.beingRetransmitted, 0)
 	}()
 
-	subflows := bc.sortedSubflows()
+	bc.muSubflows.RLock()
+	subflows := make([]*subflow, len(bc.subflows))
+	copy(subflows, bc.subflows)
+	bc.muSubflows.RUnlock()
 
 	alreadyTransmittedOnAllSubflows := false
 	for {
@@ -253,37 +279,27 @@ func selectSubflowForRetransmit(subflows []*subflow, frame *sendFrame, timeFallb
 	return true, true, selectedSubflow
 }
 
-func (bc *mpConn) sortedSubflows() []*subflow {
-	bc.muSubflows.RLock()
-	subflows := make([]*subflow, len(bc.subflows))
-	copy(subflows, bc.subflows)
-	bc.muSubflows.RUnlock()
-	sort.Slice(subflows, func(i, j int) bool {
-		// Primary sort by RTT (lower is better)
-		rttI := subflows[i].getRTT()
-		rttJ := subflows[j].getRTT()
-
-		// If RTTs are very close (within 10%), consider success rate as tiebreaker
-		if rttI > 0 && rttJ > 0 {
-			rttDiff := float64(rttI-rttJ) / float64(rttI+rttJ) * 2
-			if rttDiff < 0.1 && rttDiff > -0.1 {
-				// RTTs are close, use success rate as tiebreaker
-				successI := subflows[i].getSuccessRate()
-				successJ := subflows[j].getSuccessRate()
-				return successI > successJ
-			}
-		}
-
-		// Default to RTT-based sorting
-		return rttI < rttJ
-	})
-	return subflows
-}
-
 func (bc *mpConn) add(to string, c net.Conn, clientSide bool, probeStart time.Time, tracker StatsTracker) {
-	bc.muSubflows.Lock()
-	defer bc.muSubflows.Unlock()
-	bc.subflows = append(bc.subflows, startSubflow(to, c, bc, clientSide, probeStart, tracker))
+	// Try to acquire the lock with a timeout
+	lockAcquired := make(chan bool, 1)
+	go func() {
+		bc.muSubflows.Lock()
+		lockAcquired <- true
+	}()
+
+	select {
+	case <-lockAcquired:
+		defer bc.muSubflows.Unlock()
+		sf := startSubflow(to, c, bc, clientSide, probeStart, tracker)
+		bc.subflows = append(bc.subflows, sf)
+
+		// Start interface monitoring after first subflow is added (for server connections)
+		if len(bc.subflows) == 1 && bc.interfaceEnabled && bc.interfaceMonitor != nil {
+			go bc.startInterfaceMonitoring()
+		}
+	case <-time.After(5 * time.Second):
+		return
+	}
 }
 
 // addDynamicSubflow adds a new dynamic subflow with interface tracking
@@ -303,6 +319,30 @@ func (bc *mpConn) setOriginalDialers(dialers []Dialer) {
 // getConnectionID returns the connection ID for this multipath connection
 func (bc *mpConn) getConnectionID() connectionID {
 	return bc.cid
+}
+
+// performReconnectionHandshake performs the multipath handshake for a reconnecting subflow
+func (bc *mpConn) performReconnectionHandshake(conn net.Conn, cid connectionID) (connectionID, error) {
+	var leadBytes [leadBytesLength]byte
+	// the first byte, version, is implicitly set to 0
+	copy(leadBytes[1:], cid[:])
+	_, err := conn.Write(leadBytes[:])
+	if err != nil {
+		return zeroCID, err
+	}
+	_, err = io.ReadFull(conn, leadBytes[:])
+	if err != nil {
+		return zeroCID, err
+	}
+	if uint8(leadBytes[0]) != 0 {
+		return zeroCID, ErrUnexpectedVersion
+	}
+	var newCID connectionID
+	copy(newCID[:], leadBytes[1:])
+	if cid != zeroCID && cid != newCID {
+		return zeroCID, ErrUnexpectedCID
+	}
+	return newCID, nil
 }
 
 func (bc *mpConn) remove(theSubflow *subflow) {
@@ -398,42 +438,66 @@ func (bc *mpConn) checkSubflowHealth() {
 	bc.muSubflows.RUnlock()
 
 	for _, sf := range subflows {
+		// Check if subflow is already closed
+		if sf.isClosed() {
+			log.Debugf("Subflow %s is already closed, skipping health check", sf.to)
+			continue
+		}
+
 		// Check for stale subflows (no activity for too long)
 		timeSinceActivity := time.Since(sf.lastActivity)
 
 		// Different thresholds for dynamic vs static subflows
-		staleThreshold := 12 * time.Second
-		lowSuccessThreshold := 30 * time.Second
+		staleThreshold := 30 * time.Second      // Increased from 12s to 30s for large transfers
+		lowSuccessThreshold := 60 * time.Second // Increased from 30s to 60s
+		criticalThreshold := 120 * time.Second  // Increased from 60s to 120s
 
 		if sf.isDynamicSubflow() {
-			// Dynamic subflows get more aggressive health checks
-			staleThreshold = 8 * time.Second
-			lowSuccessThreshold = 20 * time.Second
+			// Dynamic subflows get more aggressive health checks, but still reasonable
+			staleThreshold = 20 * time.Second      // Increased from 8s to 20s
+			lowSuccessThreshold = 40 * time.Second // Increased from 20s to 40s
+			criticalThreshold = 60 * time.Second   // Increased from 30s to 60s
 		}
 
-		if timeSinceActivity > staleThreshold {
-			log.Debugf("Subflow %s appears stale (no activity for %v), marking for recovery", sf.to, timeSinceActivity)
-			bc.markSubflowAsFailed(sf, "stale")
+		// Check for critical failure (no activity for very long time)
+		if timeSinceActivity > criticalThreshold {
+			bc.markSubflowAsFailed(sf, "critical_failure")
 			continue
+		}
+
+		// Check for stale subflows - but be more lenient during active transfers
+		if timeSinceActivity > staleThreshold {
+			// Check if there are pending frames for this subflow - if so, it's still active
+			hasPendingFrames := false
+			bc.pendingAckMu.RLock()
+			for _, frame := range bc.pendingAckMap {
+				if frame.outboundSf == sf {
+					hasPendingFrames = true
+					break
+				}
+			}
+			bc.pendingAckMu.RUnlock()
+
+			if !hasPendingFrames {
+				bc.markSubflowAsFailed(sf, "stale")
+				continue
+			}
 		}
 
 		// Check for subflows with very low success rates
 		successRate := sf.getSuccessRate()
 		if successRate < 0.1 && timeSinceActivity > lowSuccessThreshold {
-			log.Debugf("Subflow %s has very low success rate (%.2f), marking for recovery", sf.to, successRate)
 			bc.markSubflowAsFailed(sf, "low_success_rate")
 			continue
 		}
 
-		// Log health status for debugging
-		if timeSinceActivity > 30*time.Second {
-			subflowType := "static"
-			if sf.isDynamicSubflow() {
-				subflowType = "dynamic"
-			}
-			log.Tracef("Subflow %s (%s) health: success rate=%.2f, last activity=%v ago, local=%s, interface=%s",
-				sf.to, subflowType, successRate, timeSinceActivity, sf.getLocalAddress(), sf.getInterfaceName())
+		// Check for subflows with high failure rates
+		failureRate := sf.getFailureRate()
+		if failureRate > 0.5 && timeSinceActivity > lowSuccessThreshold {
+			bc.markSubflowAsFailed(sf, "high_failure_rate")
+			continue
 		}
+
 	}
 }
 
@@ -458,6 +522,12 @@ func (bc *mpConn) startRecoveryMonitoring() {
 func (bc *mpConn) markSubflowAsFailed(sf *subflow, reason string) {
 	bc.muFailedSubflows.Lock()
 	defer bc.muFailedSubflows.Unlock()
+
+	// Check if already marked as failed
+	if _, exists := bc.failedSubflows[sf.to]; exists {
+		log.Debugf("Subflow %s already marked as failed, skipping duplicate marking", sf.to)
+		return
+	}
 
 	// Find the corresponding dialer for this subflow
 	var dialer Dialer
@@ -520,6 +590,31 @@ func (bc *mpConn) reconnectSubflow(failedInfo *failedSubflowInfo) {
 		return
 	}
 
+	// Perform handshake to join existing connection
+	existingCID := bc.getConnectionID()
+	if existingCID == zeroCID {
+		log.Debugf("No existing connection ID found, cannot recover subflow")
+		conn.Close()
+		return
+	}
+
+	// Perform handshake with existing connection ID
+	newCID, err := bc.performReconnectionHandshake(conn, existingCID)
+	if err != nil {
+		log.Debugf("Failed to handshake recovered subflow %s: %v", failedInfo.address, err)
+		conn.Close()
+		bc.handleReconnectionFailure(failedInfo, err)
+		return
+	}
+
+	// Verify the connection ID matches
+	if newCID != existingCID {
+		log.Debugf("Recovered subflow handshake returned different connection ID: %v != %v", newCID, existingCID)
+		conn.Close()
+		bc.handleReconnectionFailure(failedInfo, fmt.Errorf("connection ID mismatch"))
+		return
+	}
+
 	// Connection successful, add it back as a subflow
 	bc.muFailedSubflows.Lock()
 	delete(bc.failedSubflows, failedInfo.address)
@@ -530,7 +625,7 @@ func (bc *mpConn) reconnectSubflow(failedInfo *failedSubflowInfo) {
 	tracker := &NullTracker{} // Use null tracker for recovered subflows
 	bc.add(failedInfo.address, conn, true, probeStart, tracker)
 
-	log.Debugf("Successfully recovered subflow %s", failedInfo.address)
+	log.Debugf("Successfully recovered subflow %s (attempt %d)", failedInfo.address, failedInfo.recoveryAttempts+1)
 }
 
 // handleReconnectionFailure handles failed reconnection attempts

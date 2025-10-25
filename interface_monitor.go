@@ -73,8 +73,6 @@ func (im *InterfaceMonitor) Start() {
 		return
 	}
 
-	log.Debugf("Starting network interface monitoring (interval: %v)", im.monitorInterval)
-
 	// Initial scan
 	im.scanInterfaces()
 
@@ -87,7 +85,6 @@ func (im *InterfaceMonitor) Start() {
 		case <-ticker.C:
 			im.scanInterfaces()
 		case <-im.stopChan:
-			log.Debugf("Stopping network interface monitoring")
 			return
 		}
 	}
@@ -95,7 +92,12 @@ func (im *InterfaceMonitor) Start() {
 
 // Stop stops the interface monitoring
 func (im *InterfaceMonitor) Stop() {
-	close(im.stopChan)
+	select {
+	case <-im.stopChan:
+		// Already closed
+	default:
+		close(im.stopChan)
+	}
 }
 
 // scanInterfaces scans all network interfaces and detects changes
@@ -208,13 +210,11 @@ func (im *InterfaceMonitor) detectChanges(currentInterfaces map[string]*Interfac
 	// Detect new interfaces
 	for name, currentInfo := range currentInterfaces {
 		if _, exists := lastInterfaces[name]; !exists {
-			log.Debugf("New network interface detected: %s with addresses %v", name, currentInfo.Addresses)
 			im.handleNewInterface(currentInfo)
 		} else {
 			// Check for address changes
 			lastInfo := lastInterfaces[name]
 			if im.addressesChanged(lastInfo.Addresses, currentInfo.Addresses) {
-				log.Debugf("Interface %s addresses changed: %v -> %v", name, lastInfo.Addresses, currentInfo.Addresses)
 				im.handleInterfaceChange(lastInfo, currentInfo)
 			}
 		}
@@ -223,7 +223,6 @@ func (im *InterfaceMonitor) detectChanges(currentInterfaces map[string]*Interfac
 	// Detect removed interfaces
 	for name, lastInfo := range lastInterfaces {
 		if _, exists := currentInterfaces[name]; !exists {
-			log.Debugf("Network interface removed: %s", name)
 			im.handleRemovedInterface(lastInfo)
 		}
 	}
@@ -292,7 +291,6 @@ func (im *InterfaceMonitor) handleRemovedInterface(info *InterfaceInfo) {
 func (im *InterfaceMonitor) addSubflowForAddress(address, interfaceName string) {
 	// First validate that the address is actually usable for outgoing connections
 	if !im.isAddressUsableForOutgoing(address) {
-		log.Debugf("Address %s is not usable for outgoing connections, skipping", address)
 		return
 	}
 
@@ -326,7 +324,6 @@ func (im *InterfaceMonitor) addSubflowForAddress(address, interfaceName string) 
 				serverHost == "localhost" ||
 				serverHost == "127.0.0.1" ||
 				serverHost == "::1" {
-				log.Debugf("Skipping dynamic subflow creation for self-connection: %s -> %s (requires proper multipath handshake)", address, serverAddr.String())
 				continue
 			}
 		}
@@ -343,7 +340,6 @@ func (im *InterfaceMonitor) addSubflowForAddress(address, interfaceName string) 
 		cancel()
 
 		if err != nil {
-			log.Debugf("Failed to connect from %s to %s: %v", address, serverAddr, err)
 			continue
 		}
 
@@ -355,7 +351,6 @@ func (im *InterfaceMonitor) addSubflowForAddress(address, interfaceName string) 
 		// Get the existing connection ID from the multipath connection
 		existingCID := im.mpConn.getConnectionID()
 		if existingCID == zeroCID {
-			log.Debugf("No existing connection ID found, cannot add dynamic subflow")
 			conn.Close()
 			continue
 		}
@@ -363,22 +358,18 @@ func (im *InterfaceMonitor) addSubflowForAddress(address, interfaceName string) 
 		// Perform handshake with existing connection ID
 		newCID, err := im.performDynamicHandshake(conn, existingCID)
 		if err != nil {
-			log.Debugf("Failed to handshake dynamic subflow %s: %v", subflowName, err)
 			conn.Close()
 			continue
 		}
 
 		// Verify the connection ID matches
 		if newCID != existingCID {
-			log.Debugf("Dynamic subflow handshake returned different connection ID: %v != %v", newCID, existingCID)
 			conn.Close()
 			continue
 		}
 
 		// Add the new dynamic subflow after successful handshake
 		im.mpConn.addDynamicSubflow(subflowName, conn, true, probeStart, tracker, address, interfaceName)
-
-		log.Debugf("Added new subflow for local address %s to server %s on interface %s", address, serverAddr, interfaceName)
 	}
 }
 
@@ -512,7 +503,6 @@ func (im *InterfaceMonitor) removeSubflowForAddress(address string) {
 
 	// Close the subflows
 	for _, sf := range toRemove {
-		log.Debugf("Removing dynamic subflow %s for local address %s on interface %s", sf.to, address, sf.getInterfaceName())
 		go sf.close()
 	}
 }
