@@ -1,0 +1,414 @@
+package multipath
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/wlynxg/anet"
+)
+
+// InterfaceMonitor monitors network interfaces for changes and manages dynamic subflows
+type InterfaceMonitor struct {
+	mpConn          *mpConn
+	monitorInterval time.Duration
+	lastInterfaces  map[string]*InterfaceInfo
+	muInterfaces    sync.RWMutex
+	stopChan        chan struct{}
+	enabled         bool
+}
+
+// InterfaceInfo represents information about a network interface
+type InterfaceInfo struct {
+	Name       string
+	Index      int
+	Addresses  []string
+	IsUp       bool
+	IsLoopback bool
+	LastSeen   time.Time
+}
+
+// NewInterfaceMonitor creates a new interface monitor
+func NewInterfaceMonitor(mpConn *mpConn) *InterfaceMonitor {
+	return &InterfaceMonitor{
+		mpConn:          mpConn,
+		monitorInterval: 7 * time.Second, // 5-10 seconds as requested
+		lastInterfaces:  make(map[string]*InterfaceInfo),
+		stopChan:        make(chan struct{}),
+		enabled:         true,
+	}
+}
+
+// Start begins monitoring network interfaces
+func (im *InterfaceMonitor) Start() {
+	if !im.enabled {
+		return
+	}
+
+	log.Debugf("Starting network interface monitoring (interval: %v)", im.monitorInterval)
+
+	// Initial scan
+	im.scanInterfaces()
+
+	// Start periodic monitoring
+	ticker := time.NewTicker(im.monitorInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			im.scanInterfaces()
+		case <-im.stopChan:
+			log.Debugf("Stopping network interface monitoring")
+			return
+		}
+	}
+}
+
+// Stop stops the interface monitoring
+func (im *InterfaceMonitor) Stop() {
+	close(im.stopChan)
+}
+
+// scanInterfaces scans all network interfaces and detects changes
+func (im *InterfaceMonitor) scanInterfaces() {
+	// Get current interfaces using anet
+	interfaces, err := anet.Interfaces()
+	if err != nil {
+		log.Errorf("Failed to get network interfaces: %v", err)
+		return
+	}
+
+	currentInterfaces := make(map[string]*InterfaceInfo)
+
+	// Process each interface
+	for _, iface := range interfaces {
+		info := im.processInterface(iface)
+		if info != nil {
+			currentInterfaces[info.Name] = info
+		}
+	}
+
+	// Detect changes
+	im.detectChanges(currentInterfaces)
+
+	// Update last known interfaces
+	im.muInterfaces.Lock()
+	im.lastInterfaces = currentInterfaces
+	im.muInterfaces.Unlock()
+}
+
+// processInterface processes a single network interface
+func (im *InterfaceMonitor) processInterface(iface net.Interface) *InterfaceInfo {
+	// Skip loopback interfaces
+	if iface.Flags&net.FlagLoopback != 0 {
+		return nil
+	}
+
+	// Skip interfaces that are down
+	if iface.Flags&net.FlagUp == 0 {
+		return nil
+	}
+
+	// Get addresses for this interface using anet
+	addresses, err := anet.InterfaceAddrsByInterface(&iface)
+	if err != nil {
+		log.Debugf("Failed to get addresses for interface %s: %v", iface.Name, err)
+		return nil
+	}
+
+	// Filter usable addresses
+	usableAddresses := im.filterUsableAddresses(addresses)
+	if len(usableAddresses) == 0 {
+		return nil
+	}
+
+	return &InterfaceInfo{
+		Name:       iface.Name,
+		Index:      iface.Index,
+		Addresses:  usableAddresses,
+		IsUp:       iface.Flags&net.FlagUp != 0,
+		IsLoopback: iface.Flags&net.FlagLoopback != 0,
+		LastSeen:   time.Now(),
+	}
+}
+
+// filterUsableAddresses filters out loopback and invalid addresses
+func (im *InterfaceMonitor) filterUsableAddresses(addresses []net.Addr) []string {
+	var usable []string
+
+	for _, addr := range addresses {
+		// Parse the address
+		ip, _, err := net.ParseCIDR(addr.String())
+		if err != nil {
+			continue
+		}
+
+		// Skip loopback addresses
+		if ip.IsLoopback() {
+			continue
+		}
+
+		// Skip link-local addresses
+		if ip.IsLinkLocalUnicast() {
+			continue
+		}
+
+		// Skip multicast addresses
+		if ip.IsMulticast() {
+			continue
+		}
+
+		// Only include IPv4 and IPv6 addresses
+		if ip.To4() != nil || ip.To16() != nil {
+			usable = append(usable, ip.String())
+		}
+	}
+
+	return usable
+}
+
+// detectChanges detects interface changes and triggers appropriate actions
+func (im *InterfaceMonitor) detectChanges(currentInterfaces map[string]*InterfaceInfo) {
+	im.muInterfaces.RLock()
+	lastInterfaces := im.lastInterfaces
+	im.muInterfaces.RUnlock()
+
+	// Detect new interfaces
+	for name, currentInfo := range currentInterfaces {
+		if _, exists := lastInterfaces[name]; !exists {
+			log.Debugf("New network interface detected: %s with addresses %v", name, currentInfo.Addresses)
+			im.handleNewInterface(currentInfo)
+		} else {
+			// Check for address changes
+			lastInfo := lastInterfaces[name]
+			if im.addressesChanged(lastInfo.Addresses, currentInfo.Addresses) {
+				log.Debugf("Interface %s addresses changed: %v -> %v", name, lastInfo.Addresses, currentInfo.Addresses)
+				im.handleInterfaceChange(lastInfo, currentInfo)
+			}
+		}
+	}
+
+	// Detect removed interfaces
+	for name, lastInfo := range lastInterfaces {
+		if _, exists := currentInterfaces[name]; !exists {
+			log.Debugf("Network interface removed: %s", name)
+			im.handleRemovedInterface(lastInfo)
+		}
+	}
+}
+
+// addressesChanged checks if the address list has changed
+func (im *InterfaceMonitor) addressesChanged(old, new []string) bool {
+	if len(old) != len(new) {
+		return true
+	}
+
+	oldMap := make(map[string]bool)
+	for _, addr := range old {
+		oldMap[addr] = true
+	}
+
+	for _, addr := range new {
+		if !oldMap[addr] {
+			return true
+		}
+	}
+
+	return false
+}
+
+// handleNewInterface handles the detection of a new network interface
+func (im *InterfaceMonitor) handleNewInterface(info *InterfaceInfo) {
+	// Add new subflows for each address on the new interface
+	for _, address := range info.Addresses {
+		im.addSubflowForAddress(address, info.Name)
+	}
+}
+
+// handleInterfaceChange handles changes to an existing interface
+func (im *InterfaceMonitor) handleInterfaceChange(oldInfo, newInfo *InterfaceInfo) {
+	// Find addresses that were removed
+	oldMap := make(map[string]bool)
+	for _, addr := range oldInfo.Addresses {
+		oldMap[addr] = true
+	}
+
+	// Remove subflows for addresses that no longer exist
+	for _, addr := range oldInfo.Addresses {
+		if !oldMap[addr] {
+			im.removeSubflowForAddress(addr)
+		}
+	}
+
+	// Add subflows for new addresses
+	for _, addr := range newInfo.Addresses {
+		if !oldMap[addr] {
+			im.addSubflowForAddress(addr, newInfo.Name)
+		}
+	}
+}
+
+// handleRemovedInterface handles the removal of a network interface
+func (im *InterfaceMonitor) handleRemovedInterface(info *InterfaceInfo) {
+	// Remove all subflows for addresses on the removed interface
+	for _, address := range info.Addresses {
+		im.removeSubflowForAddress(address)
+	}
+}
+
+// addSubflowForAddress adds a new subflow for the given address
+func (im *InterfaceMonitor) addSubflowForAddress(address, interfaceName string) {
+	// Get the original dialers to find server addresses
+	im.mpConn.muFailedSubflows.RLock()
+	originalDialers := im.mpConn.originalDialers
+	im.mpConn.muFailedSubflows.RUnlock()
+
+	if len(originalDialers) == 0 {
+		log.Debugf("No original dialers available for dynamic subflow creation")
+		return
+	}
+
+	// Try to connect to each server address using the new local interface
+	for _, dialer := range originalDialers {
+		// Extract server address from dialer label
+		serverAddr := im.extractServerAddress(dialer.Label())
+		if serverAddr == "" {
+			continue
+		}
+
+		// Create a new dialer that binds to the specific local address
+		localDialer := &boundDialer{
+			localAddr:  address,
+			serverAddr: serverAddr,
+		}
+
+		// Attempt to connect
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		conn, err := localDialer.DialContext(ctx)
+		cancel()
+
+		if err != nil {
+			log.Debugf("Failed to connect from %s to %s: %v", address, serverAddr, err)
+			continue
+		}
+
+		// Add the new dynamic subflow
+		probeStart := time.Now()
+		tracker := &NullTracker{}
+		subflowName := fmt.Sprintf("dynamic-%s-%s", address, serverAddr)
+		im.mpConn.addDynamicSubflow(subflowName, conn, true, probeStart, tracker, address, interfaceName)
+
+		log.Debugf("Added new subflow for local address %s to server %s on interface %s", address, serverAddr, interfaceName)
+	}
+}
+
+// extractServerAddress extracts the server address from a dialer label
+func (im *InterfaceMonitor) extractServerAddress(label string) string {
+	// Try multiple common dialer label formats
+	patterns := []string{
+		"TCP dialer to ", // "TCP dialer to localhost:8080"
+		"dialer to ",     // "dialer to localhost:8080"
+		"tcp dialer to ", // "tcp dialer to localhost:8080"
+		"bound-dialer-",  // "bound-dialer-192.168.1.1->localhost:8080"
+		"dynamic-tcp-",   // "dynamic-tcp-localhost:8080"
+	}
+
+	for _, pattern := range patterns {
+		if len(label) > len(pattern) && label[:len(pattern)] == pattern {
+			address := label[len(pattern):]
+
+			// For bound-dialer format, extract the server part after "->"
+			if pattern == "bound-dialer-" {
+				if idx := strings.Index(address, "->"); idx != -1 {
+					address = address[idx+2:]
+				}
+			}
+
+			// Validate the extracted address
+			if im.isValidAddress(address) {
+				return address
+			}
+		}
+	}
+
+	// If no pattern matches, try to extract any address-like string
+	return im.extractAddressFromString(label)
+}
+
+// isValidAddress validates if the string looks like a valid network address
+func (im *InterfaceMonitor) isValidAddress(addr string) bool {
+	// Check if it contains a port (has colon and looks like host:port)
+	if strings.Contains(addr, ":") {
+		parts := strings.Split(addr, ":")
+		if len(parts) == 2 {
+			// Check if the port part is numeric
+			if _, err := strconv.Atoi(parts[1]); err == nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// extractAddressFromString tries to extract an address from any string
+func (im *InterfaceMonitor) extractAddressFromString(s string) string {
+	// Look for patterns like "host:port" in the string
+	re := regexp.MustCompile(`([a-zA-Z0-9.-]+):(\d+)`)
+	matches := re.FindStringSubmatch(s)
+	if len(matches) >= 3 {
+		return matches[0] // Return the full match (host:port)
+	}
+	return ""
+}
+
+// removeSubflowForAddress removes a subflow for the given address
+func (im *InterfaceMonitor) removeSubflowForAddress(address string) {
+	// Find and close all subflows with this local address
+	im.mpConn.muSubflows.RLock()
+	var toRemove []*subflow
+	for _, sf := range im.mpConn.subflows {
+		// Check if this is a dynamic subflow using the specified local address
+		if sf.isDynamicSubflow() && sf.getLocalAddress() == address {
+			toRemove = append(toRemove, sf)
+		}
+	}
+	im.mpConn.muSubflows.RUnlock()
+
+	// Close the subflows
+	for _, sf := range toRemove {
+		log.Debugf("Removing dynamic subflow %s for local address %s on interface %s", sf.to, address, sf.getInterfaceName())
+		go sf.close()
+	}
+}
+
+// boundDialer is a dialer that binds to a specific local address
+type boundDialer struct {
+	localAddr  string
+	serverAddr string
+}
+
+func (d *boundDialer) DialContext(ctx context.Context) (net.Conn, error) {
+	// Parse local address
+	localAddr, err := net.ResolveTCPAddr("tcp", d.localAddr+":0")
+	if err != nil {
+		return nil, err
+	}
+
+	// Create dialer with local address binding
+	dialer := &net.Dialer{
+		LocalAddr: localAddr,
+		Timeout:   2 * time.Second,
+	}
+
+	return dialer.DialContext(ctx, "tcp", d.serverAddr)
+}
+
+func (d *boundDialer) Label() string {
+	return fmt.Sprintf("bound-dialer-%s->%s", d.localAddr, d.serverAddr)
+}

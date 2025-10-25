@@ -9,6 +9,7 @@ require (
 	github.com/google/uuid v1.1.2
 	github.com/libp2p/go-buffer-pool v0.0.2
 	github.com/stretchr/testify v1.8.0
+	github.com/wlynxg/anet v0.0.5
 )
 
 require (

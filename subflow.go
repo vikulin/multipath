@@ -43,6 +43,12 @@ type subflow struct {
 	successCount  uint64
 	failureCount  uint64
 	muStats       sync.RWMutex
+
+	// Interface tracking for dynamic management
+	localAddress  string    // Local IP address this subflow uses
+	interfaceName string    // Network interface name
+	isDynamic     bool      // Whether this is a dynamically created subflow
+	createdAt     time.Time // When this subflow was created
 }
 
 func startSubflow(to string, c net.Conn, mpc *mpConn, clientSide bool, probeStart time.Time, tracker StatsTracker) *subflow {
@@ -58,6 +64,8 @@ func startSubflow(to string, c net.Conn, mpc *mpConn, clientSide bool, probeStar
 		emaRTT:       ema.NewDuration(longRTT, rttAlpha),
 		tracker:      tracker,
 		lastActivity: time.Now(),
+		createdAt:    time.Now(),
+		isDynamic:    false, // Will be set to true for dynamically created subflows
 	}
 	go sf.sendLoop()
 	if clientSide {
@@ -503,4 +511,52 @@ func (sf *subflow) getHealthScore() float64 {
 	score := rttScore * successMultiplier * activityMultiplier
 
 	return score
+}
+
+// startDynamicSubflow creates a new subflow with interface tracking information
+func startDynamicSubflow(to string, c net.Conn, mpc *mpConn, clientSide bool, probeStart time.Time, tracker StatsTracker, localAddress, interfaceName string) *subflow {
+	sf := &subflow{
+		to:              to,
+		conn:            c,
+		mpc:             mpc,
+		chClose:         make(chan struct{}),
+		sendQueue:       make(chan *sendFrame, 1),
+		finishedClosing: make(chan bool, 1),
+		// pendingPing is used for storing the subflow's ping data. Handy since pings are subflow dependent
+		pendingPing:   nil,
+		emaRTT:        ema.NewDuration(longRTT, rttAlpha),
+		tracker:       tracker,
+		lastActivity:  time.Now(),
+		createdAt:     time.Now(),
+		isDynamic:     true,
+		localAddress:  localAddress,
+		interfaceName: interfaceName,
+	}
+	go sf.sendLoop()
+	if clientSide {
+		initialRTT := time.Since(probeStart)
+		tracker.UpdateRTT(initialRTT)
+		sf.emaRTT.SetDuration(initialRTT)
+	}
+	return sf
+}
+
+// getLocalAddress returns the local address this subflow uses
+func (sf *subflow) getLocalAddress() string {
+	return sf.localAddress
+}
+
+// getInterfaceName returns the network interface name this subflow uses
+func (sf *subflow) getInterfaceName() string {
+	return sf.interfaceName
+}
+
+// isDynamicSubflow returns whether this is a dynamically created subflow
+func (sf *subflow) isDynamicSubflow() bool {
+	return sf.isDynamic
+}
+
+// getCreatedAt returns when this subflow was created
+func (sf *subflow) getCreatedAt() time.Time {
+	return sf.createdAt
 }

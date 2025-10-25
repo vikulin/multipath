@@ -39,6 +39,10 @@ type mpConn struct {
 	muFailedSubflows sync.RWMutex                  // Mutex for failed subflows
 	originalDialers  []Dialer                      // Store original dialers for reconnection
 	recoveryEnabled  bool                          // Enable/disable recovery
+
+	// Network interface monitoring
+	interfaceMonitor *InterfaceMonitor // Monitor for network interface changes
+	interfaceEnabled bool              // Enable/disable interface monitoring
 }
 
 func newMPConn(cid connectionID, remoteAddr net.Addr) *mpConn {
@@ -53,10 +57,16 @@ func newMPConn(cid connectionID, remoteAddr net.Addr) *mpConn {
 		pendingAckMu:     &sync.RWMutex{},
 		failedSubflows:   make(map[string]*failedSubflowInfo),
 		recoveryEnabled:  true,
+		interfaceEnabled: true,
 	}
+
+	// Initialize interface monitor
+	mpc.interfaceMonitor = NewInterfaceMonitor(mpc)
+
 	go mpc.retransmitLoop()
 	go mpc.startHealthMonitoring()
 	go mpc.startRecoveryMonitoring()
+	go mpc.startInterfaceMonitoring()
 	return mpc
 }
 
@@ -276,6 +286,13 @@ func (bc *mpConn) add(to string, c net.Conn, clientSide bool, probeStart time.Ti
 	bc.subflows = append(bc.subflows, startSubflow(to, c, bc, clientSide, probeStart, tracker))
 }
 
+// addDynamicSubflow adds a new dynamic subflow with interface tracking
+func (bc *mpConn) addDynamicSubflow(to string, c net.Conn, clientSide bool, probeStart time.Time, tracker StatsTracker, localAddress, interfaceName string) {
+	bc.muSubflows.Lock()
+	defer bc.muSubflows.Unlock()
+	bc.subflows = append(bc.subflows, startDynamicSubflow(to, c, bc, clientSide, probeStart, tracker, localAddress, interfaceName))
+}
+
 // setOriginalDialers stores the original dialers for recovery purposes
 func (bc *mpConn) setOriginalDialers(dialers []Dialer) {
 	bc.muFailedSubflows.Lock()
@@ -378,7 +395,18 @@ func (bc *mpConn) checkSubflowHealth() {
 	for _, sf := range subflows {
 		// Check for stale subflows (no activity for too long)
 		timeSinceActivity := time.Since(sf.lastActivity)
-		if timeSinceActivity > 12*time.Second {
+
+		// Different thresholds for dynamic vs static subflows
+		staleThreshold := 12 * time.Second
+		lowSuccessThreshold := 30 * time.Second
+
+		if sf.isDynamicSubflow() {
+			// Dynamic subflows get more aggressive health checks
+			staleThreshold = 8 * time.Second
+			lowSuccessThreshold = 20 * time.Second
+		}
+
+		if timeSinceActivity > staleThreshold {
 			log.Debugf("Subflow %s appears stale (no activity for %v), marking for recovery", sf.to, timeSinceActivity)
 			bc.markSubflowAsFailed(sf, "stale")
 			continue
@@ -386,7 +414,7 @@ func (bc *mpConn) checkSubflowHealth() {
 
 		// Check for subflows with very low success rates
 		successRate := sf.getSuccessRate()
-		if successRate < 0.1 && timeSinceActivity > 30*time.Second {
+		if successRate < 0.1 && timeSinceActivity > lowSuccessThreshold {
 			log.Debugf("Subflow %s has very low success rate (%.2f), marking for recovery", sf.to, successRate)
 			bc.markSubflowAsFailed(sf, "low_success_rate")
 			continue
@@ -394,8 +422,12 @@ func (bc *mpConn) checkSubflowHealth() {
 
 		// Log health status for debugging
 		if timeSinceActivity > 30*time.Second {
-			log.Tracef("Subflow %s health: success rate=%.2f, last activity=%v ago",
-				sf.to, successRate, timeSinceActivity)
+			subflowType := "static"
+			if sf.isDynamicSubflow() {
+				subflowType = "dynamic"
+			}
+			log.Tracef("Subflow %s (%s) health: success rate=%.2f, last activity=%v ago, local=%s, interface=%s",
+				sf.to, subflowType, successRate, timeSinceActivity, sf.getLocalAddress(), sf.getInterfaceName())
 		}
 	}
 }
@@ -526,4 +558,13 @@ func (bc *mpConn) handleReconnectionFailure(failedInfo *failedSubflowInfo, err e
 		log.Debugf("Giving up on subflow %s after %d failed attempts", failedInfo.address, failedInfo.recoveryAttempts)
 		delete(bc.failedSubflows, failedInfo.address)
 	}
+}
+
+// startInterfaceMonitoring starts the network interface monitoring
+func (bc *mpConn) startInterfaceMonitoring() {
+	if !bc.interfaceEnabled || bc.interfaceMonitor == nil {
+		return
+	}
+
+	bc.interfaceMonitor.Start()
 }
