@@ -35,6 +35,7 @@ func newMPConn(cid connectionID, remoteAddr net.Addr) *mpConn {
 		pendingAckMu:     &sync.RWMutex{},
 	}
 	go mpc.retransmitLoop()
+	go mpc.startHealthMonitoring()
 	return mpc
 }
 
@@ -324,5 +325,49 @@ func (bc *mpConn) isPendingAck(fn uint64) bool {
 		return bc.pendingAckMap[fn] != nil
 	}
 	return false
+}
 
+// startHealthMonitoring starts a goroutine to monitor subflow health
+func (bc *mpConn) startHealthMonitoring() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	
+	for range ticker.C {
+		if atomic.LoadUint32(&bc.closed) == 1 {
+			return
+		}
+		bc.checkSubflowHealth()
+	}
+}
+
+// checkSubflowHealth checks the health of all subflows and takes action if needed
+func (bc *mpConn) checkSubflowHealth() {
+	bc.muSubflows.RLock()
+	subflows := make([]*subflow, len(bc.subflows))
+	copy(subflows, bc.subflows)
+	bc.muSubflows.RUnlock()
+	
+	for _, sf := range subflows {
+		// Check for stale subflows (no activity for too long)
+		timeSinceActivity := time.Since(sf.lastActivity)
+		if timeSinceActivity > 60*time.Second {
+			log.Debugf("Subflow %s appears stale (no activity for %v), closing", sf.to, timeSinceActivity)
+			go sf.close()
+			continue
+		}
+		
+		// Check for subflows with very low success rates
+		successRate := sf.getSuccessRate()
+		if successRate < 0.1 && timeSinceActivity > 30*time.Second {
+			log.Debugf("Subflow %s has very low success rate (%.2f), closing", sf.to, successRate)
+			go sf.close()
+			continue
+		}
+		
+		// Log health status for debugging
+		if timeSinceActivity > 30*time.Second {
+			log.Tracef("Subflow %s health: success rate=%.2f, last activity=%v ago", 
+				sf.to, successRate, timeSinceActivity)
+		}
+	}
 }

@@ -160,12 +160,17 @@ func (sf *subflow) readLoopFrames(ch chan *rxFrame, r byteReader) bool {
 }
 
 func (sf *subflow) sendLoop() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Errorf("Panic in sendLoop for %s: %v", sf.to, r)
+			sf.close()
+		}
+		sf.finishedClosing <- true
+	}()
+
 	closing := false
 	closeCountdown := time.NewTimer(time.Millisecond * 33)
 	closeCountdown.Stop()
-	defer func() {
-		sf.finishedClosing <- true
-	}()
 
 	go func() {
 		<-sf.chClose
