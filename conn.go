@@ -300,6 +300,11 @@ func (bc *mpConn) setOriginalDialers(dialers []Dialer) {
 	bc.originalDialers = dialers
 }
 
+// getConnectionID returns the connection ID for this multipath connection
+func (bc *mpConn) getConnectionID() connectionID {
+	return bc.cid
+}
+
 func (bc *mpConn) remove(theSubflow *subflow) {
 	bc.muSubflows.Lock()
 	var remains []*subflow

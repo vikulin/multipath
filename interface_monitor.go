@@ -3,6 +3,7 @@ package multipath
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"sync"
@@ -346,10 +347,35 @@ func (im *InterfaceMonitor) addSubflowForAddress(address, interfaceName string) 
 			continue
 		}
 
-		// Add the new dynamic subflow
+		// Perform multipath handshake to join existing connection
 		probeStart := time.Now()
 		tracker := &NullTracker{}
 		subflowName := fmt.Sprintf("dynamic-%s-%s", address, serverAddr)
+
+		// Get the existing connection ID from the multipath connection
+		existingCID := im.mpConn.getConnectionID()
+		if existingCID == zeroCID {
+			log.Debugf("No existing connection ID found, cannot add dynamic subflow")
+			conn.Close()
+			continue
+		}
+
+		// Perform handshake with existing connection ID
+		newCID, err := im.performDynamicHandshake(conn, existingCID)
+		if err != nil {
+			log.Debugf("Failed to handshake dynamic subflow %s: %v", subflowName, err)
+			conn.Close()
+			continue
+		}
+
+		// Verify the connection ID matches
+		if newCID != existingCID {
+			log.Debugf("Dynamic subflow handshake returned different connection ID: %v != %v", newCID, existingCID)
+			conn.Close()
+			continue
+		}
+
+		// Add the new dynamic subflow after successful handshake
 		im.mpConn.addDynamicSubflow(subflowName, conn, true, probeStart, tracker, address, interfaceName)
 
 		log.Debugf("Added new subflow for local address %s to server %s on interface %s", address, serverAddr, interfaceName)
@@ -445,6 +471,30 @@ func (im *InterfaceMonitor) testAddressUsability(address string) bool {
 	}
 
 	return true
+}
+
+// performDynamicHandshake performs the multipath handshake for a dynamic subflow
+func (im *InterfaceMonitor) performDynamicHandshake(conn net.Conn, cid connectionID) (connectionID, error) {
+	var leadBytes [leadBytesLength]byte
+	// the first byte, version, is implicitly set to 0
+	copy(leadBytes[1:], cid[:])
+	_, err := conn.Write(leadBytes[:])
+	if err != nil {
+		return zeroCID, err
+	}
+	_, err = io.ReadFull(conn, leadBytes[:])
+	if err != nil {
+		return zeroCID, err
+	}
+	if uint8(leadBytes[0]) != 0 {
+		return zeroCID, ErrUnexpectedVersion
+	}
+	var newCID connectionID
+	copy(newCID[:], leadBytes[1:])
+	if cid != zeroCID && cid != newCID {
+		return zeroCID, ErrUnexpectedCID
+	}
+	return newCID, nil
 }
 
 // removeSubflowForAddress removes a subflow for the given address
