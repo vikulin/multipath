@@ -394,8 +394,19 @@ type boundDialer struct {
 }
 
 func (d *boundDialer) DialContext(ctx context.Context) (net.Conn, error) {
-	// Parse local address
-	localAddr, err := net.ResolveTCPAddr("tcp", d.localAddr+":0")
+	// Parse local address - handle IPv6 properly
+	var localAddr *net.TCPAddr
+	var err error
+
+	// Check if it's an IPv6 address (contains colons)
+	if strings.Contains(d.localAddr, ":") {
+		// For IPv6, we need to wrap in brackets and add port
+		localAddr, err = net.ResolveTCPAddr("tcp", "["+d.localAddr+"]:0")
+	} else {
+		// For IPv4, just append port
+		localAddr, err = net.ResolveTCPAddr("tcp", d.localAddr+":0")
+	}
+
 	if err != nil {
 		return nil, err
 	}
