@@ -80,6 +80,15 @@ var (
 	ErrFailOnAllDialers  = errors.New("fail on all dialers")
 	log                  = golog.LoggerFor("multipath")
 	zeroCID              connectionID
+	
+	// Frame pool for reusing sendFrame objects
+	framePool = sync.Pool{
+		New: func() interface{} {
+			return &sendFrame{
+				sentVia: make([]transmissionDatapoint, 0, 4), // Pre-allocate with capacity
+			}
+		},
+	}
 )
 
 type connectionID uuid.UUID
@@ -106,16 +115,36 @@ type sendFrame struct {
 }
 
 func composeFrame(fn uint64, b []byte) *sendFrame {
-	sz := len(b)
-	buf := pool.Get(maxVarIntLength + maxVarIntLength + sz)
-	wb := bytes.NewBuffer(buf[:0])
-	WriteVarInt(wb, uint64(sz))
+	// Get frame from pool
+	frame := framePool.Get().(*sendFrame)
+	
+	// Reset frame state
+	frame.fn = fn
+	frame.sz = uint64(len(b))
+	frame.retransmissions = 0
+	frame.beingRetransmitted = 0
+	frame.released = new(int32)
+	
+	// Reuse buffer if possible, otherwise get new one
+	requiredSize := maxVarIntLength + maxVarIntLength + len(b)
+	if frame.buf != nil && cap(frame.buf) >= requiredSize {
+		// Reuse existing buffer
+		frame.buf = frame.buf[:0]
+	} else {
+		// Get new buffer from pool
+		frame.buf = pool.Get(requiredSize)
+	}
+	
+	// Compose frame data
+	wb := bytes.NewBuffer(frame.buf[:0])
+	WriteVarInt(wb, uint64(len(b)))
 	WriteVarInt(wb, fn)
-	if sz > 0 {
+	if len(b) > 0 {
 		wb.Write(b)
 	}
-	var released int32
-	return &sendFrame{fn: fn, sz: uint64(sz), buf: wb.Bytes(), released: &released}
+	frame.buf = wb.Bytes()
+	
+	return frame
 }
 
 func (f *sendFrame) isDataFrame() bool {
@@ -124,7 +153,25 @@ func (f *sendFrame) isDataFrame() bool {
 
 func (f *sendFrame) release() {
 	if atomic.CompareAndSwapInt32(f.released, 0, 1) {
+		// Return buffer to pool
 		pool.Put(f.buf)
+		// Reset frame and return to frame pool
+		f.reset()
+		framePool.Put(f)
+	}
+}
+
+// reset prepares the frame for reuse in the pool
+func (f *sendFrame) reset() {
+	f.fn = 0
+	f.sz = 0
+	f.buf = nil
+	f.released = nil
+	f.retransmissions = 0
+	f.beingRetransmitted = 0
+	// Reset sentVia slice but keep capacity
+	if f.sentVia != nil {
+		f.sentVia = f.sentVia[:0]
 	}
 }
 
