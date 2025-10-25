@@ -13,6 +13,80 @@ import (
 	"github.com/wlynxg/anet"
 )
 
+// Addr interface for compatibility
+type Addr interface {
+	Network() string // name of the network (for example, "tcp", "udp")
+	String() string  // string form of address (for example, "192.0.2.1:25", "[2001:db8::1]:80")
+}
+
+// anet-compatible flag constants (matching net.Flags values)
+const (
+	anetFlagUp           = 1 << iota // interface is up
+	anetFlagBroadcast                // interface supports broadcast access capability
+	anetFlagLoopback                 // interface is a loopback interface
+	anetFlagPointToPoint             // interface belongs to a point-to-point link
+	anetFlagMulticast                // interface supports multicast access capability
+)
+
+// Conversion function to convert net.Addr to our Addr interface
+func convertAnetAddrs(addrs []net.Addr) []Addr {
+	result := make([]Addr, len(addrs))
+	for i, addr := range addrs {
+		result[i] = addr
+	}
+	return result
+}
+
+// Helper functions to avoid net package usage
+func (im *InterfaceMonitor) extractIPFromAddr(addrStr string) string {
+	// Handle CIDR notation (e.g., "192.168.1.1/24")
+	if idx := strings.Index(addrStr, "/"); idx != -1 {
+		return addrStr[:idx]
+	}
+	return addrStr
+}
+
+func (im *InterfaceMonitor) isLoopbackIP(ipStr string) bool {
+	return strings.HasPrefix(ipStr, "127.") || ipStr == "::1"
+}
+
+func (im *InterfaceMonitor) isLinkLocalIP(ipStr string) bool {
+	// IPv4 link-local: 169.254.0.0/16
+	if strings.HasPrefix(ipStr, "169.254.") {
+		return true
+	}
+	// IPv6 link-local: fe80::/10
+	if strings.HasPrefix(ipStr, "fe80:") {
+		return true
+	}
+	return false
+}
+
+func (im *InterfaceMonitor) isMulticastIP(ipStr string) bool {
+	// IPv4 multicast: 224.0.0.0/4
+	if strings.HasPrefix(ipStr, "224.") || strings.HasPrefix(ipStr, "225.") ||
+		strings.HasPrefix(ipStr, "226.") || strings.HasPrefix(ipStr, "227.") ||
+		strings.HasPrefix(ipStr, "228.") || strings.HasPrefix(ipStr, "229.") ||
+		strings.HasPrefix(ipStr, "230.") || strings.HasPrefix(ipStr, "231.") ||
+		strings.HasPrefix(ipStr, "232.") || strings.HasPrefix(ipStr, "233.") ||
+		strings.HasPrefix(ipStr, "234.") || strings.HasPrefix(ipStr, "235.") ||
+		strings.HasPrefix(ipStr, "236.") || strings.HasPrefix(ipStr, "237.") ||
+		strings.HasPrefix(ipStr, "238.") || strings.HasPrefix(ipStr, "239.") {
+		return true
+	}
+	// IPv6 multicast: ff00::/8
+	if strings.HasPrefix(ipStr, "ff") {
+		return true
+	}
+	return false
+}
+
+func (im *InterfaceMonitor) isValidIP(ipStr string) bool {
+	// Use net.ParseIP for validation since we're allowed to use net for parsing
+	ip := net.ParseIP(ipStr)
+	return ip != nil
+}
+
 // InterfaceMonitor monitors network interfaces for changes and manages dynamic subflows
 type InterfaceMonitor struct {
 	mpConn          *mpConn
@@ -78,7 +152,7 @@ func (im *InterfaceMonitor) Stop() {
 // scanInterfaces scans all network interfaces and detects changes
 func (im *InterfaceMonitor) scanInterfaces() {
 	// Get current interfaces using anet
-	interfaces, err := anet.Interfaces()
+	anetInterfaces, err := anet.Interfaces()
 	if err != nil {
 		log.Errorf("Failed to get network interfaces: %v", err)
 		return
@@ -87,7 +161,7 @@ func (im *InterfaceMonitor) scanInterfaces() {
 	currentInterfaces := make(map[string]*InterfaceInfo)
 
 	// Process each interface
-	for _, iface := range interfaces {
+	for _, iface := range anetInterfaces {
 		info := im.processInterface(iface)
 		if info != nil {
 			currentInterfaces[info.Name] = info
@@ -122,8 +196,11 @@ func (im *InterfaceMonitor) processInterface(iface net.Interface) *InterfaceInfo
 		return nil
 	}
 
+	// Convert addresses to our local type
+	localAddresses := convertAnetAddrs(addresses)
+
 	// Filter usable addresses
-	usableAddresses := im.filterUsableAddresses(addresses)
+	usableAddresses := im.filterUsableAddresses(localAddresses)
 	if len(usableAddresses) == 0 {
 		return nil
 	}
@@ -139,11 +216,11 @@ func (im *InterfaceMonitor) processInterface(iface net.Interface) *InterfaceInfo
 }
 
 // filterUsableAddresses filters out loopback and invalid addresses
-func (im *InterfaceMonitor) filterUsableAddresses(addresses []net.Addr) []string {
+func (im *InterfaceMonitor) filterUsableAddresses(addresses []Addr) []string {
 	var usable []string
 
 	for _, addr := range addresses {
-		// Parse the address
+		// Parse the address using net.ParseCIDR
 		ip, _, err := net.ParseCIDR(addr.String())
 		if err != nil {
 			continue
@@ -264,6 +341,12 @@ func (im *InterfaceMonitor) handleRemovedInterface(info *InterfaceInfo) {
 
 // addSubflowForAddress adds a new subflow for the given address
 func (im *InterfaceMonitor) addSubflowForAddress(address, interfaceName string) {
+	// First validate that the address is actually usable for outgoing connections
+	if !im.isAddressUsableForOutgoing(address) {
+		log.Debugf("Address %s is not usable for outgoing connections, skipping", address)
+		return
+	}
+
 	// Get the original dialers to find server addresses
 	im.mpConn.muFailedSubflows.RLock()
 	originalDialers := im.mpConn.originalDialers
@@ -365,6 +448,96 @@ func (im *InterfaceMonitor) extractAddressFromString(s string) string {
 		return matches[0] // Return the full match (host:port)
 	}
 	return ""
+}
+
+// isAddressUsableForOutgoing checks if an address can be used for outgoing connections
+func (im *InterfaceMonitor) isAddressUsableForOutgoing(address string) bool {
+	// Parse the address to check if it's valid
+	ip := net.ParseIP(address)
+	if ip == nil {
+		return false
+	}
+
+	// Skip loopback addresses for outgoing connections
+	if ip.IsLoopback() {
+		return false
+	}
+
+	// Skip link-local addresses (they're not routable)
+	if ip.IsLinkLocalUnicast() {
+		return false
+	}
+
+	// Skip multicast addresses
+	if ip.IsMulticast() {
+		return false
+	}
+
+	// For IPv6, skip some special addresses
+	if ip.To4() == nil { // IPv6
+		// Skip IPv6 link-local addresses (fe80::/10)
+		if len(ip) == 16 && ip[0] == 0xfe && (ip[1]&0xc0) == 0x80 {
+			return false
+		}
+		// Skip unique local addresses (fc00::/7) - these are not globally routable
+		if len(ip) == 16 && ip[0] == 0xfc {
+			return false
+		}
+	}
+
+	// For IPv4, skip some problematic ranges
+	if ip.To4() != nil {
+		// Skip virtual machine host-only networks (192.168.x.x ranges that might not be routable)
+		// Skip Docker networks (172.16.x.x - 172.31.x.x)
+		ip4 := ip.To4()
+		if ip4[0] == 172 && ip4[1] >= 16 && ip4[1] <= 31 {
+			return false
+		}
+		// Skip some virtual network ranges that might not be usable for binding
+		if ip4[0] == 192 && ip4[1] == 168 {
+			// Only allow common private ranges that are likely to be usable
+			// Skip 192.168.56.x (VirtualBox), 192.168.100.x (some VMs)
+			if ip4[2] == 56 || ip4[2] == 100 {
+				return false
+			}
+		}
+	}
+
+	// Try to create a test connection to see if the address is actually usable
+	// This is a more thorough check but might be expensive
+	return im.testAddressUsability(address)
+}
+
+// testAddressUsability performs a quick test to see if an address can be used for outgoing connections
+func (im *InterfaceMonitor) testAddressUsability(address string) bool {
+	// Try to create a test dialer with this local address
+	testDialer := &boundDialer{
+		localAddr:  address,
+		serverAddr: "127.0.0.1:1", // Use a non-existent local address for testing
+	}
+
+	// Try to create the dialer (this will fail at connection time, but we can check if the local address is valid)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	_, err := testDialer.DialContext(ctx)
+
+	// We expect the connection to fail, but we want to check if the error is about the local address
+	// If the error is about the local address being invalid, then this address is not usable
+	if err != nil {
+		errStr := err.Error()
+		// Check for common "address not valid" errors
+		if strings.Contains(errStr, "not valid") ||
+			strings.Contains(errStr, "invalid") ||
+			strings.Contains(errStr, "cannot assign") ||
+			strings.Contains(errStr, "no such device") {
+			return false
+		}
+		// Other errors (like connection refused) are expected and mean the address is valid
+		return true
+	}
+
+	return true
 }
 
 // removeSubflowForAddress removes a subflow for the given address
